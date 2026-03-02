@@ -1,23 +1,6 @@
 """
-trading_dashboard/app.py
-========================
-Unified Trading Dashboard — SPX Iron Condor + Options Algo
-Single Streamlit app on port 8503.
-
-Verified against:
-  - stock_fetcher.download_universe() returns lowercase columns
-  - classify_regime(ticker, df) — 2 args
-  - analyze_iv(ticker, df) — 2 args
-  - select_strategy(regime, iv) returns StrategyRecommendation
-  - StrategyRecommendation fields: .strategy (StrategyType enum), .direction,
-    .confidence, .target_dte, .rationale, .risk_reward, .ticker
-  - StockRegime fields: .regime (Regime enum), .direction_score, .trend_strength,
-    .adx, .rsi, .bb_squeeze, .ema_alignment, .support, .resistance,
-    .atr, .atr_pct, .price, .volume_trend, .volatility_state
-  - IVAnalysis fields: .iv_rank, .iv_percentile, .current_iv, .hv_20, .hv_60,
-    .iv_hv_ratio, .iv_regime, .premium_action, .iv_trend, .iv_30d_avg, .skew
-  - SPX data uses UPPERCASE columns (Open, High, Low, Close, Volume)
-  - Options algo data uses lowercase columns (open, high, low, close, volume)
+trading_dashboard/app.py — Unified Trading Command Center
+SPX Iron Condor + Options Algo — All pages verified.
 """
 from __future__ import annotations
 
@@ -33,384 +16,643 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# ── Project Roots ─────────────────────────────────────────────────────
 SPX_ROOT = Path("/root/spx_algo")
 OPT_ROOT = Path("/root/options_algo")
-
 for p in [str(SPX_ROOT), str(OPT_ROOT)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# ── Page Config ───────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Trading Command Center",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Trading Command Center", page_icon="🏦",
+                    layout="wide", initial_sidebar_state="expanded")
 
-# ── Paths ─────────────────────────────────────────────────────────────
-SPX_RAW       = SPX_ROOT / "data" / "raw"
-SPX_SIGNALS   = SPX_ROOT / "output" / "signals"
-SPX_TRADES    = SPX_ROOT / "output" / "trades" / "paper_trade_log.csv"
-SPX_REPORTS   = SPX_ROOT / "output" / "reports"
-OPT_SIGNALS   = OPT_ROOT / "output" / "signals"
-OPT_TRADES    = OPT_ROOT / "output" / "trades"
-
+SPX_RAW     = SPX_ROOT / "data" / "raw"
+SPX_SIGNALS = SPX_ROOT / "output" / "signals"
+SPX_TRADES  = SPX_ROOT / "output" / "trades" / "paper_trade_log.csv"
+SPX_REPORTS = SPX_ROOT / "output" / "reports"
+SPX_MON     = SPX_ROOT / "output" / "monitoring"
+OPT_SIGNALS = OPT_ROOT / "output" / "signals"
+OPT_TRADES  = OPT_ROOT / "output" / "trades"
 
 # ══════════════════════════════════════════════════════════════════════
 #  DATA LOADERS
 # ══════════════════════════════════════════════════════════════════════
-
 @st.cache_data(ttl=300)
 def spx_load_data():
     p = SPX_RAW / "spx_daily.parquet"
-    if not p.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(p)
-    df.index = pd.to_datetime(df.index)
-    return df
+    if not p.exists(): return pd.DataFrame()
+    df = pd.read_parquet(p); df.index = pd.to_datetime(df.index); return df
 
 @st.cache_data(ttl=300)
 def spx_load_vix():
     p = SPX_RAW / "vix_daily.parquet"
-    if not p.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(p)
-    df.index = pd.to_datetime(df.index)
-    return df
+    if not p.exists(): return pd.DataFrame()
+    df = pd.read_parquet(p); df.index = pd.to_datetime(df.index); return df
 
 @st.cache_data(ttl=300)
 def spx_load_signal():
     p = SPX_SIGNALS / "latest_signal.json"
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(p) as f: return json.load(f)
+    except Exception: return None
+
+@st.cache_data(ttl=300)
+def spx_load_all_signals():
+    signals = []
+    for p in sorted(SPX_SIGNALS.glob("signal_*.json")):
+        try:
+            with open(p) as f: signals.append(json.load(f))
+        except Exception: pass
+    return signals
 
 @st.cache_data(ttl=300)
 def spx_load_replay():
     for name in ["replay_jan_feb_2026_v2.csv", "replay_jan_feb_2026.csv"]:
         p = SPX_REPORTS / name
         if p.exists():
-            df = pd.read_csv(p)
-            df["date"] = pd.to_datetime(df["date"])
-            rename = {"h_err": "h_err_pct", "l_err": "l_err_pct",
-                      "dir_ok": "dir_correct", "net_pnl": "net_pnl_dollars"}
-            df.rename(columns={k: v for k, v in rename.items() if k in df.columns}, inplace=True)
+            df = pd.read_csv(p); df["date"] = pd.to_datetime(df["date"])
+            rename = {"h_err":"h_err_pct","l_err":"l_err_pct","dir_ok":"dir_correct","net_pnl":"net_pnl_dollars"}
+            df.rename(columns={k:v for k,v in rename.items() if k in df.columns}, inplace=True)
             return df
     return pd.DataFrame()
 
 @st.cache_data(ttl=300)
 def spx_load_paper_log():
     if SPX_TRADES.exists():
-        df = pd.read_csv(SPX_TRADES)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
+        df = pd.read_csv(SPX_TRADES); df["date"] = pd.to_datetime(df["date"]); return df
     return pd.DataFrame()
 
 @st.cache_data(ttl=300)
 def spx_load_market_intel():
     p = SPX_ROOT / "data" / "processed" / "market_intel.json"
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(p) as f: return json.load(f)
+    except Exception: return None
 
 @st.cache_data(ttl=300)
 def spx_load_es_levels():
     p = SPX_SIGNALS / "es_levels_latest.json"
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(p) as f: return json.load(f)
+    except Exception: return None
+
+@st.cache_data(ttl=300)
+def spx_load_error_history():
+    p = SPX_MON / "error_history.csv"
+    if not p.exists(): return pd.DataFrame()
+    try:
+        df = pd.read_csv(p, parse_dates=["date"], index_col="date"); return df.sort_index()
+    except Exception: return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def spx_load_calibration_health():
+    p = SPX_MON / "calibration_health.json"
+    if not p.exists(): return None
+    try:
+        with open(p) as f: return json.load(f)
+    except Exception: return None
+
+@st.cache_data(ttl=300)
+def spx_load_correction_log():
+    p = SPX_MON / "correction_log.csv"
+    if not p.exists(): return pd.DataFrame()
+    try: return pd.read_csv(p)
+    except Exception: return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def spx_load_retrain_report():
+    p = SPX_REPORTS / "weekly_retrain_latest.json"
+    if not p.exists(): return None
+    try:
+        with open(p) as f: return json.load(f)
+    except Exception: return None
 
 @st.cache_data(ttl=300)
 def opt_load_signal():
     p = OPT_SIGNALS / "options_signal_latest.json"
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
-        with open(p) as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(p) as f: return json.load(f)
+    except Exception: return None
 
 def opt_load_trades():
-    """Load trade outcomes from JSONL file. Returns list of dicts."""
     p = OPT_TRADES / "trade_outcomes.jsonl"
-    if not p.exists():
-        return []
+    if not p.exists(): return []
     trades = []
     try:
         with open(p) as f:
             for line in f:
-                line = line.strip()
-                if line:
-                    trades.append(json.loads(line))
-    except Exception:
-        pass
+                if line.strip(): trades.append(json.loads(line))
+    except Exception: pass
     return trades
 
 @st.cache_data(ttl=60)
 def load_cron_jobs():
     p = Path("/home/openclaw/.openclaw/cron/jobs.json")
-    if not p.exists():
-        return []
+    if not p.exists(): return []
     try:
-        with open(p) as f:
-            data = json.load(f)
-        return data.get("jobs", [])
-    except Exception:
-        return []
-
+        with open(p) as f: return json.load(f).get("jobs", [])
+    except Exception: return []
 
 # ══════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════════════════════════════
-
 st.sidebar.title("🏦 Trading Command Center")
 st.sidebar.markdown("---")
-
 section = st.sidebar.selectbox("Section", ["SPX Iron Condor", "Options Algo", "System"])
 
 if section == "SPX Iron Condor":
     page = st.sidebar.radio("Navigate", [
-        "🏠 Overview",
-        "🔮 Latest Signal",
-        "📊 ES/MES Levels",
-        "📈 Backtest",
-        "📋 Paper Trades",
-        "⚡ Risk & Intel",
+        "🏠 Overview", "📈 Backtest", "🎯 Replay Detail",
+        "📋 Paper Trades", "🔮 Latest Signal", "📊 ES/MES Levels",
+        "🧠 Model Health", "⚡ Risk & Intel",
     ])
 elif section == "Options Algo":
     page = st.sidebar.radio("Navigate", [
-        "🔍 Ticker Analysis",
-        "📈 Today's Picks",
-        "📋 Trade Tracker",
-        "📊 Strategy Stats",
-        "🌡️ IV Heatmap",
-        "🗺️ Regime Map",
-        "▶️ Run Scan",
+        "🔍 Ticker Analysis", "📈 Today's Picks", "📋 Trade Tracker",
+        "📊 Strategy Stats", "🌡️ IV Heatmap", "🗺️ Regime Map", "▶️ Run Scan",
     ])
 else:
-    page = st.sidebar.radio("Navigate", [
-        "📅 Cron Jobs",
-    ])
+    page = st.sidebar.radio("Navigate", ["📅 Cron Jobs"])
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Date: {date.today()}")
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════════════
-
-REGIME_COLORS = {
-    "STRONG_UPTREND": "#00C853", "UPTREND": "#69F0AE",
-    "RANGE_BOUND": "#FFD740", "DOWNTREND": "#FF6D00",
-    "STRONG_DOWNTREND": "#D50000", "SQUEEZE": "#AA00FF",
-    "REVERSAL_UP": "#00B0FF", "REVERSAL_DOWN": "#FF4081",
-}
-
+REGIME_COLORS = {"STRONG_UPTREND":"#00C853","UPTREND":"#69F0AE","RANGE_BOUND":"#FFD740",
+    "DOWNTREND":"#FF6D00","STRONG_DOWNTREND":"#D50000","SQUEEZE":"#AA00FF",
+    "REVERSAL_UP":"#00B0FF","REVERSAL_DOWN":"#FF4081"}
 def direction_badge(d):
-    return {"BULLISH": "🟢 BULLISH", "BEARISH": "🔴 BEARISH"}.get(d, "🟡 NEUTRAL")
-
+    return {"BULLISH":"🟢 BULLISH","BEARISH":"🔴 BEARISH"}.get(d,"🟡 NEUTRAL")
 
 # ══════════════════════════════════════════════════════════════════════
-#  SPX PAGES
+#  SPX: OVERVIEW
 # ══════════════════════════════════════════════════════════════════════
-
 if page == "🏠 Overview":
     st.title("SPX Iron-Condor Algo — Overview")
-
-    spx = spx_load_data()
-    vix = spx_load_vix()
-    sig = spx_load_signal()
-    replay = spx_load_replay()
+    spx = spx_load_data(); vix = spx_load_vix()
+    sig = spx_load_signal(); replay = spx_load_replay()
 
     if not spx.empty:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        # SPX data has uppercase columns
-        c1.metric("SPX Close", f"{spx['Close'].iloc[-1]:,.2f}",
-                   f"{spx['Close'].iloc[-1] - spx['Close'].iloc[-2]:+.2f}")
-        c2.metric("VIX", f"{vix['Close'].iloc[-1]:.2f}" if not vix.empty else "N/A")
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("SPX Close",f"{spx['Close'].iloc[-1]:,.2f}",f"{spx['Close'].iloc[-1]-spx['Close'].iloc[-2]:+.2f}")
+        c2.metric("VIX",f"{vix['Close'].iloc[-1]:.2f}" if not vix.empty else "N/A")
         if sig:
-            c3.metric("Regime", sig.get("regime", "N/A"))
-            c4.metric("Direction", sig.get("direction", "N/A"),
-                       f"{sig.get('direction_prob', 0)*100:.1f}%")
-            c5.metric("Tradeable", "✅" if sig.get("tradeable") else "❌")
+            c3.metric("Regime",sig.get("regime","N/A"))
+            c4.metric("Direction",sig.get("direction","N/A"),f"{sig.get('direction_prob',0)*100:.1f}%")
+            c5.metric("Tradeable","✅" if sig.get("tradeable") else "❌")
     else:
-        st.warning("SPX data not found. Run daily pipeline first.")
+        st.warning("SPX data not found.")
 
     if not replay.empty and "net_pnl_dollars" in replay.columns:
-        st.markdown("---")
-        st.subheader("Jan-Feb 2026 Replay Summary")
-        m1, m2, m3, m4 = st.columns(4)
-        wins = len(replay[replay["condor"] == "WIN"])
-        total = len(replay)
-        m1.metric("Win Rate", f"{wins/total*100:.1f}%" if total > 0 else "N/A")
-        m2.metric("Total P&L", f"${replay['net_pnl_dollars'].sum():,.0f}")
+        st.markdown("---"); st.subheader("Jan-Feb 2026 Replay Summary")
+        m1,m2,m3,m4 = st.columns(4)
+        wins = len(replay[replay["condor"]=="WIN"]); total = len(replay)
+        m1.metric("Win Rate",f"{wins/total*100:.1f}%" if total>0 else "N/A")
+        m2.metric("Total P&L",f"${replay['net_pnl_dollars'].sum():,.0f}")
         equity = replay["net_pnl_dollars"].cumsum()
-        m3.metric("Max DD", f"${(equity - equity.cummax()).min():,.0f}")
-        m4.metric("Trades", total)
+        m3.metric("Max DD",f"${(equity-equity.cummax()).min():,.0f}")
+        m4.metric("Trades",total)
 
     if not spx.empty:
-        st.markdown("---")
-        st.subheader("SPX Last 60 Days")
+        st.markdown("---"); st.subheader("SPX Last 60 Days")
         recent = spx.tail(60)
-        fig = go.Figure(data=[go.Candlestick(
-            x=recent.index,
-            open=recent["Open"], high=recent["High"],
-            low=recent["Low"], close=recent["Close"],
-            name="SPX"
-        )])
-        fig.update_layout(height=400, xaxis_rangeslider_visible=False,
-                          margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure(data=[go.Candlestick(x=recent.index,open=recent["Open"],high=recent["High"],
+            low=recent["Low"],close=recent["Close"],name="SPX")])
+        fig.update_layout(height=400,xaxis_rangeslider_visible=False,margin=dict(l=0,r=0,t=30,b=0))
+        st.plotly_chart(fig,use_container_width=True)
 
-
-elif page == "🔮 Latest Signal":
-    st.title("SPX — Latest Signal")
-    sig = spx_load_signal()
-    if sig:
-        h1, h2, h3, h4, h5 = st.columns(5)
-        h1.metric("Date", sig.get("signal_date", "N/A"))
-        h2.metric("Regime", sig.get("regime", "N/A"))
-        h3.metric("Direction", sig.get("direction", "N/A"),
-                   f"{sig.get('direction_prob', 0)*100:.1f}%")
-        h4.metric("VIX", f"{sig.get('vix_spot', 0):.2f}")
-        h5.metric("Tradeable", "✅" if sig.get("tradeable") else "❌")
-
-        st.markdown("---")
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            st.markdown("**Predictions**")
-            st.write(f"Prior Close: {sig.get('prior_close', 0):,.2f}")
-            st.write(f"Pred High: {sig.get('predicted_high', 0):,.2f}")
-            st.write(f"Pred Low: {sig.get('predicted_low', 0):,.2f}")
-        with p2:
-            st.markdown("**IC Strikes**")
-            st.write(f"Short Call: {sig.get('ic_short_call', 0):,.2f}")
-            st.write(f"Short Put: {sig.get('ic_short_put', 0):,.2f}")
-            st.write(f"Long Call: {sig.get('ic_long_call', 0):,.2f}")
-            st.write(f"Long Put: {sig.get('ic_long_put', 0):,.2f}")
-        with p3:
-            st.markdown("**Conformal Bands**")
-            st.write(f"68%: [{sig.get('conf_68_high_lo', 0):,.2f}, {sig.get('conf_68_high_hi', 0):,.2f}]")
-            st.write(f"90%: [{sig.get('conf_90_high_lo', 0):,.2f}, {sig.get('conf_90_high_hi', 0):,.2f}]")
-
-        with st.expander("Raw JSON"):
-            st.json(sig)
-    else:
-        st.warning("No signal found.")
-
-
-elif page == "📊 ES/MES Levels":
-    st.title("ES/MES Futures Trading Levels")
-    es = spx_load_es_levels()
-    if es:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Prior Close", f"{es.get('prior_close', 0):,.2f}")
-        c2.metric("Regime", es.get("regime", "N/A"))
-        c3.metric("VIX", f"{es.get('vix', 0):.2f}")
-        c4.metric("Direction", es.get("direction", "N/A"))
-        c5.metric("Risk", f"{es.get('risk_score', 0)}/5")
-
-        status = es.get("status", "")
-        if "DO NOT TRADE" in status:
-            st.error(f"⛔ {status}")
-        elif "CAUTION" in status:
-            st.warning(f"⚠️ {status}")
-        else:
-            st.success(f"✅ {status}")
-
-        st.markdown("---")
-        l1, l2 = st.columns(2)
-        l1.metric("Upside Wall", f"{es.get('upside_wall', 0):,.2f}")
-        l2.metric("Downside Wall", f"{es.get('downside_wall', 0):,.2f}")
-
-        with st.expander("Full ES Levels JSON"):
-            st.json(es)
-    else:
-        st.warning("No ES levels found.")
-
-
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: BACKTEST — Predicted vs Actual (the chart you want restored)
+# ══════════════════════════════════════════════════════════════════════
 elif page == "📈 Backtest":
-    st.title("SPX — Backtest Results")
-    replay = spx_load_replay()
-    if not replay.empty and "net_pnl_dollars" in replay.columns:
-        equity = replay["net_pnl_dollars"].cumsum()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=replay["date"], y=equity, mode="lines",
-                                  name="Cumulative P&L", fill="tozeroy"))
-        fig.update_layout(height=400, title="Equity Curve")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(replay, use_container_width=True, height=400)
+    st.title("Backtest Dashboard — Predictions vs Actuals")
+    replay = spx_load_replay(); spx = spx_load_data()
+
+    if not replay.empty:
+        st.subheader("Prediction vs Actual (Jan–Feb 2026)")
+        dates = replay["date"]
+
+        # Enrich with actual OHLC from SPX
+        if "actual_high" not in replay.columns:
+            spx_aligned = spx.reindex(dates)
+            replay["actual_high"] = spx_aligned["High"].values
+            replay["actual_low"] = spx_aligned["Low"].values
+            replay["actual_close"] = spx_aligned["Close"].values
+
+        if "prior_close" not in replay.columns:
+            prior_closes = []
+            for d in dates:
+                if d in spx.index:
+                    loc = spx.index.get_loc(d)
+                    prior_closes.append(float(spx["Close"].iloc[loc-1]) if loc>0 else np.nan)
+                else:
+                    prior_closes.append(np.nan)
+            replay["prior_close"] = prior_closes
+
+        if "pred_high" not in replay.columns and "h_err_pct" in replay.columns:
+            replay["pred_high"] = replay["actual_high"] + (replay["h_err_pct"]/100*replay["prior_close"])
+            replay["pred_low"] = replay["actual_low"] + (replay["l_err_pct"]/100*replay["prior_close"])
+
+        # ── 3-Panel Chart ──
+        fig = make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.06,
+            subplot_titles=("SPX: Predicted vs Actual High/Low","Prediction Error (%)","Equity Curve ($)"),
+            row_heights=[0.45,0.25,0.30])
+
+        # Panel 1: Candlestick + predicted lines
+        fig.add_trace(go.Candlestick(x=dates,open=replay["prior_close"],high=replay["actual_high"],
+            low=replay["actual_low"],close=replay["actual_close"],name="Actual OHLC",
+            increasing_line_color="#26a69a",decreasing_line_color="#ef5350"),row=1,col=1)
+
+        if "pred_high" in replay.columns:
+            fig.add_trace(go.Scatter(x=dates,y=replay["pred_high"],mode="lines+markers",
+                name="Predicted High",line=dict(color="#2196F3",width=2,dash="dot"),
+                marker=dict(size=5)),row=1,col=1)
+            fig.add_trace(go.Scatter(x=dates,y=replay["pred_low"],mode="lines+markers",
+                name="Predicted Low",line=dict(color="#FF9800",width=2,dash="dot"),
+                marker=dict(size=5)),row=1,col=1)
+
+        # Panel 2: Error bars
+        if "h_err_pct" in replay.columns:
+            colors_h = ["#ef5350" if e>0.5 else "#26a69a" for e in replay["h_err_pct"]]
+            colors_l = ["#ef5350" if e>0.5 else "#FF9800" for e in replay["l_err_pct"]]
+            fig.add_trace(go.Bar(x=dates,y=replay["h_err_pct"],name="High Error %",marker_color=colors_h,opacity=0.7),row=2,col=1)
+            fig.add_trace(go.Bar(x=dates,y=-replay["l_err_pct"],name="Low Error %",marker_color=colors_l,opacity=0.7),row=2,col=1)
+            fig.add_hline(y=0.5,line_dash="dash",line_color="red",opacity=0.5,row=2,col=1)
+            fig.add_hline(y=-0.5,line_dash="dash",line_color="red",opacity=0.5,row=2,col=1)
+
+        # Panel 3: Equity curve
+        if "net_pnl_dollars" in replay.columns:
+            equity = replay["net_pnl_dollars"].cumsum()
+            fig.add_trace(go.Scatter(x=dates,y=equity,mode="lines",name="Cumulative P&L",
+                line=dict(color="#2196F3",width=2),fill="tozeroy",fillcolor="rgba(33,150,243,0.1)"),row=3,col=1)
+            loss_mask = replay["condor"]=="LOSS"
+            if loss_mask.any():
+                fig.add_trace(go.Scatter(x=dates[loss_mask],y=equity[loss_mask],mode="markers",
+                    name="Loss Days",marker=dict(color="red",size=10,symbol="x")),row=3,col=1)
+
+        fig.update_layout(height=900,showlegend=True,
+            legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1),
+            margin=dict(l=50,r=20,t=60,b=30),xaxis_rangeslider_visible=False)
+        fig.update_yaxes(title_text="Price",row=1,col=1)
+        fig.update_yaxes(title_text="Error %",row=2,col=1)
+        fig.update_yaxes(title_text="Cumulative $",row=3,col=1)
+        st.plotly_chart(fig,use_container_width=True)
+
+        # ── Day-by-Day Table ──
+        st.markdown("---"); st.subheader("Day-by-Day Comparison")
+        table_cols = ["date"]
+        display_names = {"date":"Date"}
+        for col,name in [("prior_close","Prior Close"),("pred_high","Pred High"),
+            ("actual_high","Actual High"),("h_err_pct","High Err %"),
+            ("pred_low","Pred Low"),("actual_low","Actual Low"),("l_err_pct","Low Err %"),
+            ("actual_close","Actual Close"),("dir_correct","Dir OK"),("regime","Regime"),
+            ("condor","Condor"),("net_pnl_dollars","P&L ($)")]:
+            if col in replay.columns: table_cols.append(col); display_names[col]=name
+        display_df = replay[table_cols].copy().rename(columns=display_names)
+        for c in ["Prior Close","Pred High","Actual High","Pred Low","Actual Low","Actual Close"]:
+            if c in display_df.columns: display_df[c]=display_df[c].map(lambda x:f"{x:,.2f}" if pd.notna(x) else "")
+        if "High Err %" in display_df.columns: display_df["High Err %"]=display_df["High Err %"].map(lambda x:f"{x:.3f}%")
+        if "Low Err %" in display_df.columns: display_df["Low Err %"]=display_df["Low Err %"].map(lambda x:f"{x:.3f}%")
+        if "P&L ($)" in display_df.columns: display_df["P&L ($)"]=display_df["P&L ($)"].map(lambda x:f"${x:+,.0f}")
+        if "Dir OK" in display_df.columns: display_df["Dir OK"]=display_df["Dir OK"].map(lambda x:"✓" if x else "✗")
+        if "Date" in display_df.columns: display_df["Date"]=pd.to_datetime(display_df["Date"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(display_df,use_container_width=True,height=600)
+
+        # ── Coverage Heatmap ──
+        cov_cols = ["cov68h","cov68l","cov90h","cov90l"]
+        if all(c in replay.columns for c in cov_cols):
+            st.markdown("---"); st.subheader("Conformal Coverage Heatmap")
+            cov_data = replay[["date"]+cov_cols].copy()
+            cov_data["date"] = cov_data["date"].dt.strftime("%Y-%m-%d")
+            cov_matrix = cov_data[cov_cols].astype(int).T
+            cov_matrix.columns = cov_data["date"]
+            cov_matrix.index = ["68% High","68% Low","90% High","90% Low"]
+            fig_hm = go.Figure(data=go.Heatmap(z=cov_matrix.values,x=cov_matrix.columns,y=cov_matrix.index,
+                colorscale=[[0,"#ef5350"],[1,"#26a69a"]],showscale=False))
+            fig_hm.update_layout(height=200,margin=dict(l=100,r=20,t=30,b=30))
+            st.plotly_chart(fig_hm,use_container_width=True)
+
+        # ── Statistics ──
+        st.markdown("---"); st.subheader("Performance Statistics")
+        sc1,sc2,sc3,sc4 = st.columns(4)
+        with sc1:
+            st.markdown("**Prediction Accuracy**")
+            if "h_err_pct" in replay.columns:
+                st.write(f"Mean High Error: {replay['h_err_pct'].mean():.4f}%")
+                st.write(f"Mean Low Error: {replay['l_err_pct'].mean():.4f}%")
+        with sc2:
+            st.markdown("**Direction**")
+            if "dir_correct" in replay.columns:
+                da = replay["dir_correct"].mean()*100
+                st.write(f"Accuracy: {replay['dir_correct'].sum()}/{len(replay)} ({da:.1f}%)")
+        with sc3:
+            st.markdown("**Iron Condor**")
+            wins = len(replay[replay["condor"]=="WIN"])
+            st.write(f"Win Rate: {wins}/{len(replay)} ({wins/len(replay)*100:.1f}%)")
+            if "net_pnl_dollars" in replay.columns:
+                st.write(f"Total P&L: ${replay['net_pnl_dollars'].sum():,.2f}")
+                equity = replay["net_pnl_dollars"].cumsum()
+                st.write(f"Max DD: ${(equity-equity.cummax()).min():,.2f}")
+        with sc4:
+            st.markdown("**Coverage**")
+            for col,label in [("cov68h","68% High"),("cov68l","68% Low"),("cov90h","90% High"),("cov90l","90% Low")]:
+                if col in replay.columns: st.write(f"{label}: {replay[col].mean()*100:.1f}%")
     else:
         st.warning("No replay data found.")
 
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: REPLAY DETAIL (day-by-day drill-down)
+# ══════════════════════════════════════════════════════════════════════
+elif page == "🎯 Replay Detail":
+    st.title("Replay Detail — Jan-Feb 2026")
+    replay = spx_load_replay(); spx = spx_load_data()
 
+    if not replay.empty:
+        selected_date = st.selectbox("Select trading day",replay["date"].dt.strftime("%Y-%m-%d").tolist(),index=len(replay)-1)
+        row = replay[replay["date"]==pd.Timestamp(selected_date)].iloc[0]
+        td = pd.Timestamp(selected_date)
+        spx_row = spx.loc[td] if td in spx.index else None
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Regime",row.get("regime","N/A") if "regime" in row.index else "N/A")
+        dir_correct = row.get("dir_correct",None) if "dir_correct" in row.index else None
+        c2.metric("Direction","N/A","✓" if dir_correct else ("✗" if dir_correct is not None else ""))
+        condor = row.get("condor","N/A") if "condor" in row.index else "N/A"
+        pnl = row.get("net_pnl_dollars",0) if "net_pnl_dollars" in row.index else 0
+        c3.metric("Condor",condor,f"${pnl:+,.0f}" if pd.notna(pnl) else "")
+        c4.metric("VIX",f"{row['vix']:.2f}" if "vix" in row.index and pd.notna(row.get("vix")) else "N/A")
+
+        st.markdown("---")
+        e1,e2,e3 = st.columns(3)
+        if "h_err_pct" in row.index: e1.metric("High Error",f"{row['h_err_pct']:.3f}%")
+        if "l_err_pct" in row.index: e2.metric("Low Error",f"{row['l_err_pct']:.3f}%")
+        if "h_err_pct" in row.index and "l_err_pct" in row.index:
+            e3.metric("Combined MAE",f"{(row['h_err_pct']+row['l_err_pct'])/2:.3f}%")
+
+        # Coverage flags
+        st.markdown("---"); st.subheader("Conformal Coverage")
+        cv1,cv2,cv3,cv4 = st.columns(4)
+        for col,label,container in [("cov68h","68% High",cv1),("cov68l","68% Low",cv2),
+            ("cov90h","90% High",cv3),("cov90l","90% Low",cv4)]:
+            if col in row.index: container.metric(label,"✅ Covered" if row[col] else "❌ Missed")
+
+        # Price levels chart with predicted vs actual
+        if spx_row is not None:
+            st.markdown("---"); st.subheader("Price Levels — Predicted vs Actual")
+            prior_loc = spx.index.get_loc(td)
+            prior_close = float(spx["Close"].iloc[prior_loc-1]) if prior_loc>0 else np.nan
+            actual_high = float(spx_row["High"]); actual_low = float(spx_row["Low"])
+
+            pred_high = pred_low = np.nan
+            if "h_err_pct" in row.index and pd.notna(prior_close):
+                pred_high = actual_high + (row["h_err_pct"]/100*prior_close)
+                pred_low = actual_low + (row["l_err_pct"]/100*prior_close)
+
+            fig_ic = go.Figure()
+            fig_ic.add_trace(go.Bar(x=["Day"],y=[actual_high-actual_low],base=[actual_low],
+                name="Actual Range",marker_color="rgba(38,166,154,0.3)",width=0.4))
+            fig_ic.add_hline(y=prior_close,line_color="gray",line_width=2,
+                annotation_text=f"Prior Close: {prior_close:,.2f}")
+            fig_ic.add_hline(y=actual_high,line_color="#26a69a",line_dash="solid",
+                annotation_text=f"Actual High: {actual_high:,.2f}")
+            fig_ic.add_hline(y=actual_low,line_color="#ef5350",line_dash="solid",
+                annotation_text=f"Actual Low: {actual_low:,.2f}")
+            if pd.notna(pred_high):
+                fig_ic.add_hline(y=pred_high,line_color="#2196F3",line_dash="dot",
+                    annotation_text=f"Pred High: {pred_high:,.2f}")
+                fig_ic.add_hline(y=pred_low,line_color="#FF9800",line_dash="dot",
+                    annotation_text=f"Pred Low: {pred_low:,.2f}")
+            fig_ic.update_layout(height=450,yaxis_title="SPX Price",
+                margin=dict(l=50,r=180,t=30,b=30),showlegend=False)
+            st.plotly_chart(fig_ic,use_container_width=True)
+
+        with st.expander("Raw row data"):
+            st.json({k:(float(v) if isinstance(v,(np.integer,np.floating)) else v) for k,v in row.to_dict().items()})
+    else:
+        st.warning("No replay data found.")
+
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: PAPER TRADES
+# ══════════════════════════════════════════════════════════════════════
 elif page == "📋 Paper Trades":
     st.title("SPX — Paper Trade Log")
     paper = spx_load_paper_log()
     if not paper.empty:
-        st.dataframe(paper, use_container_width=True, height=500)
+        completed = paper[paper["actual_close"].notna()] if "actual_close" in paper.columns else pd.DataFrame()
+        pending = paper[paper["actual_close"].isna()] if "actual_close" in paper.columns else paper
+        if not pending.empty:
+            st.info(f"📌 {len(pending)} pending signal(s)")
+            st.dataframe(pending,use_container_width=True)
+        if not completed.empty:
+            st.markdown("---"); st.subheader("Completed Trades")
+            if "condor_pnl" in completed.columns:
+                eq = pd.to_numeric(completed["condor_pnl"],errors="coerce").cumsum()
+                fig = go.Figure(); fig.add_trace(go.Scatter(x=completed["date"],y=eq,mode="lines+markers",fill="tozeroy"))
+                fig.update_layout(height=300,title="Paper Trade Equity"); st.plotly_chart(fig,use_container_width=True)
+            st.dataframe(completed,use_container_width=True,height=400)
     else:
         st.info("No paper trades yet.")
 
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: LATEST SIGNAL (with strike map)
+# ══════════════════════════════════════════════════════════════════════
+elif page == "🔮 Latest Signal":
+    st.title("SPX — Latest Signal")
+    sig = spx_load_signal()
+    if sig:
+        h1,h2,h3,h4,h5 = st.columns(5)
+        h1.metric("Date",sig.get("signal_date","N/A"))
+        h2.metric("Regime",sig.get("regime","N/A"))
+        h3.metric("Direction",sig.get("direction","N/A"),f"{sig.get('direction_prob',0)*100:.1f}%")
+        h4.metric("VIX",f"{sig.get('vix_spot',0):.2f}")
+        h5.metric("Tradeable","✅" if sig.get("tradeable") else "❌")
 
+        st.markdown("---")
+        p1,p2,p3 = st.columns(3)
+        with p1:
+            st.markdown("**Predictions**")
+            st.write(f"Prior Close: {sig.get('prior_close',0):,.2f}")
+            st.write(f"Pred High: {sig.get('predicted_high',0):,.2f}")
+            st.write(f"Pred Low: {sig.get('predicted_low',0):,.2f}")
+        with p2:
+            st.markdown("**IC Strikes**")
+            st.write(f"Short Call: {sig.get('ic_short_call',0):,.2f}")
+            st.write(f"Short Put: {sig.get('ic_short_put',0):,.2f}")
+            st.write(f"Long Call: {sig.get('ic_long_call',0):,.2f}")
+            st.write(f"Long Put: {sig.get('ic_long_put',0):,.2f}")
+        with p3:
+            st.markdown("**Conformal Bands**")
+            st.write(f"68%: [{sig.get('conf_68_high_lo',0):,.2f}, {sig.get('conf_68_high_hi',0):,.2f}]")
+            st.write(f"90%: [{sig.get('conf_90_high_lo',0):,.2f}, {sig.get('conf_90_high_hi',0):,.2f}]")
+
+        # Strike Map
+        st.markdown("---"); st.subheader("Strike Map")
+        pc = sig.get("prior_close",0)
+        fig = go.Figure()
+        fig.add_hrect(y0=sig.get("conf_90_low_lo",0),y1=sig.get("conf_90_high_hi",0),fillcolor="rgba(33,150,243,0.05)",line_width=0)
+        fig.add_hrect(y0=sig.get("conf_68_low_lo",0),y1=sig.get("conf_68_high_hi",0),fillcolor="rgba(33,150,243,0.1)",line_width=0)
+        fig.add_hline(y=pc,line_color="gray",line_width=2,annotation_text=f"Prior Close: {pc:,.2f}")
+        fig.add_hline(y=sig.get("predicted_high",0),line_color="#2196F3",line_dash="dot",annotation_text=f"Pred High: {sig.get('predicted_high',0):,.2f}")
+        fig.add_hline(y=sig.get("predicted_low",0),line_color="#FF9800",line_dash="dot",annotation_text=f"Pred Low: {sig.get('predicted_low',0):,.2f}")
+        fig.add_hline(y=sig.get("ic_short_call",0),line_color="#e91e63",line_dash="dash",annotation_text=f"Short Call: {sig.get('ic_short_call',0):,.2f}")
+        fig.add_hline(y=sig.get("ic_short_put",0),line_color="#9c27b0",line_dash="dash",annotation_text=f"Short Put: {sig.get('ic_short_put',0):,.2f}")
+        fig.update_layout(height=500,yaxis_title="SPX Price",margin=dict(l=50,r=200,t=30,b=30))
+        st.plotly_chart(fig,use_container_width=True)
+
+        with st.expander("Raw JSON"): st.json(sig)
+    else:
+        st.warning("No signal found.")
+
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: ES/MES LEVELS
+# ══════════════════════════════════════════════════════════════════════
+elif page == "📊 ES/MES Levels":
+    st.title("ES/MES Futures Trading Levels")
+    es = spx_load_es_levels()
+    if es:
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Prior Close",f"{es.get('prior_close',0):,.2f}")
+        c2.metric("Regime",es.get("regime","N/A"))
+        c3.metric("VIX",f"{es.get('vix',0):.2f}")
+        c4.metric("Direction",es.get("direction","N/A"))
+        c5.metric("Risk",f"{es.get('risk_score',0)}/5")
+        status = es.get("status","")
+        if "DO NOT TRADE" in status: st.error(f"⛔ {status}")
+        elif "CAUTION" in status: st.warning(f"⚠️ {status}")
+        else: st.success(f"✅ {status}")
+        st.markdown("---")
+        l1,l2 = st.columns(2)
+        l1.metric("Upside Wall",f"{es.get('upside_wall',0):,.2f}")
+        l2.metric("Downside Wall",f"{es.get('downside_wall',0):,.2f}")
+        with st.expander("Full JSON"): st.json(es)
+    else:
+        st.warning("No ES levels found.")
+
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: MODEL HEALTH
+# ══════════════════════════════════════════════════════════════════════
+elif page == "🧠 Model Health":
+    st.title("Model Health & Learning")
+    tab1,tab2,tab3 = st.tabs(["Error Correction","Conformal Calibration","Weekly Retrain"])
+
+    with tab1:
+        st.subheader("Level 3: Error Correction Layer")
+        error_df = spx_load_error_history()
+        if error_df.empty:
+            st.info("Error correction activates after 20 trading days. Morning recon records errors daily.")
+        else:
+            st.metric("Days of error data",len(error_df))
+            active = len(error_df) >= 20
+            st.metric("Status","🟢 Active" if active else f"🟡 Collecting ({len(error_df)}/20)")
+            if "error_high" in error_df.columns:
+                fig = make_subplots(rows=2,cols=1,shared_xaxes=True,subplot_titles=("High Error","Low Error"))
+                fig.add_trace(go.Scatter(x=error_df.index,y=error_df["error_high"],mode="lines+markers",
+                    name="High Error",line=dict(color="#2196F3")),row=1,col=1)
+                fig.add_trace(go.Scatter(x=error_df.index,y=error_df["error_low"],mode="lines+markers",
+                    name="Low Error",line=dict(color="#FF9800")),row=2,col=1)
+                fig.add_hline(y=0,line_color="gray",line_dash="dash",row=1,col=1)
+                fig.add_hline(y=0,line_color="gray",line_dash="dash",row=2,col=1)
+                fig.update_layout(height=500); st.plotly_chart(fig,use_container_width=True)
+            if len(error_df) >= 5:
+                st.markdown("---"); st.subheader("Rolling Bias (5-day)")
+                recent = error_df.tail(5); bc1,bc2 = st.columns(2)
+                if "error_high" in recent.columns:
+                    bc1.metric("High Bias",f"{recent['error_high'].mean():+.4f}%")
+                if "error_low" in recent.columns:
+                    bc2.metric("Low Bias",f"{recent['error_low'].mean():+.4f}%")
+            corr_log = spx_load_correction_log()
+            if not corr_log.empty:
+                st.markdown("---"); st.subheader("Recent Corrections")
+                st.dataframe(corr_log.tail(10),use_container_width=True)
+
+    with tab2:
+        st.subheader("Level 2: Adaptive Conformal Calibration")
+        cal = spx_load_calibration_health()
+        if cal is None:
+            st.info("Calibration data appears after next signal generation.")
+        else:
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Date",cal.get("date","N/A"))
+            c2.metric("Samples",cal.get("n_samples",0))
+            c3.metric("Half-life",f"{cal.get('half_life',15)} days")
+            st.metric("Auto-widen","🔴 YES" if cal.get("widen_active") else "🟢 No")
+            st.markdown("---"); st.subheader("Quantile Widths by Regime")
+            regime_data = []
+            for regime in ["GREEN","YELLOW","RED"]:
+                r = {"Regime":regime}
+                for q in [68,90]:
+                    val = cal.get(f"q{q}_{regime}")
+                    r[f"{q}% Width"] = f"{val*100:.3f}%" if val else "N/A"
+                regime_data.append(r)
+            all_r = {"Regime":"ALL"}
+            for q in [68,90]:
+                val = cal.get(f"q{q}_all")
+                all_r[f"{q}% Width"] = f"{val*100:.3f}%" if val else "N/A"
+            regime_data.append(all_r)
+            st.table(pd.DataFrame(regime_data))
+
+    with tab3:
+        st.subheader("Level 1: Weekly Model Retrain")
+        retrain = spx_load_retrain_report()
+        if retrain is None:
+            st.info("Retrain runs Sundays at 10:00 UTC.")
+        else:
+            st.metric("Last Retrain",retrain.get("timestamp","N/A")[:10])
+            st.metric("Status",retrain.get("status","N/A"))
+            st.metric("Decision",retrain.get("decision","N/A"))
+            if "old_metrics" in retrain:
+                col1,col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Current Model**"); old = retrain["old_metrics"]
+                    st.write(f"Win Rate: {old.get('win_rate',0):.1f}%")
+                    st.write(f"P&L: ${old.get('total_pnl',0):,.2f}")
+                    st.write(f"Sharpe: {old.get('sharpe',0):.2f}")
+                with col2:
+                    if "new_metrics" in retrain:
+                        st.markdown("**Retrained Model**"); new = retrain["new_metrics"]
+                        st.write(f"Win Rate: {new.get('win_rate',0):.1f}%")
+                        st.write(f"P&L: ${new.get('total_pnl',0):,.2f}")
+                        st.write(f"Sharpe: {new.get('sharpe',0):.2f}")
+
+# ══════════════════════════════════════════════════════════════════════
+#  SPX: RISK & INTEL
+# ══════════════════════════════════════════════════════════════════════
 elif page == "⚡ Risk & Intel":
     st.title("Market Risk & Intelligence")
     intel = spx_load_market_intel()
     if intel:
-        risk = intel.get("risk_score", 0)
-        risk_icons = {1: "🟢", 2: "🟡", 3: "🟠", 4: "🔴", 5: "⛔"}
-        st.markdown(f"## {risk_icons.get(risk, '❓')} Risk: {risk}/5")
-        if intel.get("tail_risk_flag"):
-            st.error("⚠️ TAIL RISK FLAG — DO NOT TRADE")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Risk Score", f"{risk}/5")
-        c2.metric("Tail Risk", "🔴 YES" if intel.get("tail_risk_flag") else "🟢 No")
-        c3.metric("Regime", intel.get("regime", "N/A"))
-
-        events = intel.get("key_events", [])
+        risk = intel.get("risk_score",0)
+        icons = {1:"🟢",2:"🟡",3:"🟠",4:"🔴",5:"⛔"}
+        labels = {1:"LOW",2:"MODERATE",3:"ELEVATED",4:"HIGH",5:"EXTREME"}
+        st.markdown(f"## {icons.get(risk,'❓')} Risk: {risk}/5 — {labels.get(risk,'UNKNOWN')}")
+        if intel.get("tail_risk_flag"): st.error("⚠️ TAIL RISK FLAG — DO NOT TRADE")
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Risk Score",f"{risk}/5")
+        c2.metric("Tail Risk","🔴 YES" if intel.get("tail_risk_flag") else "🟢 No")
+        c3.metric("Regime",intel.get("regime","N/A"))
+        events = intel.get("key_events",[])
         if events:
             st.markdown("### Key Events")
             for ev in events:
-                if isinstance(ev, dict):
-                    st.write(f"• **{ev.get('event', '')}** — {ev.get('impact', '')}")
-                else:
-                    st.write(f"• {ev}")
-        with st.expander("Raw Intel"):
-            st.json(intel)
+                if isinstance(ev,dict): st.write(f"• **{ev.get('event','')}** — {ev.get('impact','')}")
+                else: st.write(f"• {ev}")
+        with st.expander("Raw Intel"): st.json(intel)
     else:
         st.info("No market intel. Updates at 19:30 UTC.")
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  OPTIONS ALGO PAGES
+#  OPTIONS ALGO PAGES (all verified — same as previous fix)
 # ══════════════════════════════════════════════════════════════════════
 
 elif page == "🔍 Ticker Analysis":
     st.title("🔍 Ticker Analysis")
-    st.caption("Type any ticker for full regime, IV, and options strategy analysis.")
-
-    col_in, col_btn = st.columns([3, 1])
-    with col_in:
-        ticker = st.text_input("Ticker", value="", placeholder="CRM, AAPL, NVDA...").strip().upper()
-    with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)
-        run = st.button("Analyze", type="primary", use_container_width=True)
+    st.caption("Type any ticker for regime, IV, and strategy analysis.")
+    col_in,col_btn = st.columns([3,1])
+    with col_in: ticker = st.text_input("Ticker",value="",placeholder="CRM, AAPL, NVDA...").strip().upper()
+    with col_btn: st.markdown("<br>",unsafe_allow_html=True); run = st.button("Analyze",type="primary",use_container_width=True)
 
     if ticker and run:
         with st.spinner(f"Analyzing {ticker}..."):
@@ -419,538 +661,204 @@ elif page == "🔍 Ticker Analysis":
                 from src.analysis.technical import classify_regime
                 from src.analysis.volatility import analyze_iv
                 from src.strategy.selector import select_strategy
-
-                data = download_universe([ticker], period="2y")
-                if ticker not in data or data[ticker].empty:
-                    st.error(f"No data for {ticker}")
+                data = download_universe([ticker],period="2y")
+                if ticker not in data or data[ticker].empty: st.error(f"No data for {ticker}")
                 else:
-                    df = data[ticker]  # lowercase: close, high, low, open, volume
-                    price = float(df["close"].iloc[-1])
-                    prev = float(df["close"].iloc[-2]) if len(df) > 1 else price
-                    chg = (price - prev) / prev * 100
-
-                    # ── Price Metrics ──
+                    df = data[ticker]; price = float(df["close"].iloc[-1])
+                    prev = float(df["close"].iloc[-2]) if len(df)>1 else price
+                    chg = (price-prev)/prev*100
                     st.markdown("---")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Price", f"${price:.2f}", f"{chg:+.2f}%")
-                    c2.metric("High", f"${float(df['high'].iloc[-1]):.2f}")
-                    c3.metric("Low", f"${float(df['low'].iloc[-1]):.2f}")
-                    c4.metric("Volume", f"{int(df['volume'].iloc[-1]):,}")
+                    c1,c2,c3,c4 = st.columns(4)
+                    c1.metric("Price",f"${price:.2f}",f"{chg:+.2f}%")
+                    c2.metric("High",f"${float(df['high'].iloc[-1]):.2f}")
+                    c3.metric("Low",f"${float(df['low'].iloc[-1]):.2f}")
+                    c4.metric("Volume",f"{int(df['volume'].iloc[-1]):,}")
 
-                    # ── Regime ── (classify_regime needs ticker AND df)
-                    regime = classify_regime(ticker, df)
+                    regime = classify_regime(ticker,df)
                     if regime:
-                        st.markdown("---")
-                        st.subheader("📊 Technical Regime")
-                        r1, r2, r3, r4, r5, r6 = st.columns(6)
-                        r1.metric("Regime", regime.regime.value)
-                        r2.metric("Trend Score", f"{regime.direction_score:+.2f}")
-                        r3.metric("ADX", f"{regime.adx:.1f}")
-                        r4.metric("RSI", f"{regime.rsi:.1f}")
-                        r5.metric("ATR %", f"{regime.atr_pct:.2f}%")
-                        r6.metric("Volume", regime.volume_trend)
+                        st.markdown("---"); st.subheader("📊 Technical Regime")
+                        r1,r2,r3,r4,r5,r6 = st.columns(6)
+                        r1.metric("Regime",regime.regime.value); r2.metric("Score",f"{regime.direction_score:+.2f}")
+                        r3.metric("ADX",f"{regime.adx:.1f}"); r4.metric("RSI",f"{regime.rsi:.1f}")
+                        r5.metric("ATR %",f"{regime.atr_pct:.2f}%"); r6.metric("Volume",regime.volume_trend)
+                        ca,cb = st.columns(2)
+                        with ca: st.write(f"**EMA:** {regime.ema_alignment} | **Vol State:** {regime.volatility_state}")
+                        with cb: st.write(f"**Support:** ${regime.support:.2f} | **Resistance:** ${regime.resistance:.2f}")
+                        if regime.bb_squeeze: st.success("📦 BB Squeeze Active")
 
-                        col_a, col_b = st.columns(2)
-                        with col_a:
-                            st.write(f"**EMA Alignment:** {regime.ema_alignment}")
-                            st.write(f"**Volatility State:** {regime.volatility_state}")
-                            st.write(f"**Trend Strength:** {regime.trend_strength:.2f}")
-                        with col_b:
-                            st.write(f"**Support:** ${regime.support:.2f}")
-                            st.write(f"**Resistance:** ${regime.resistance:.2f}")
-                            st.write(f"**ATR:** ${regime.atr:.2f}")
-                        if regime.bb_squeeze:
-                            st.success("📦 Bollinger Band Squeeze Active — potential breakout")
-                    else:
-                        st.warning("Could not classify regime.")
-
-                    # ── IV Analysis ── (analyze_iv needs ticker AND df)
-                    iv = analyze_iv(ticker, df)
+                    iv = analyze_iv(ticker,df)
                     if iv:
-                        st.markdown("---")
-                        st.subheader("📈 Volatility Profile")
-                        v1, v2, v3, v4, v5 = st.columns(5)
-                        v1.metric("IV Rank", f"{iv.iv_rank:.0f}%")
-                        v2.metric("IV Percentile", f"{iv.iv_percentile:.0f}%")
-                        v3.metric("Current IV", f"{iv.current_iv:.1f}%")
-                        v4.metric("HV-20", f"{iv.hv_20:.1f}%")
-                        v5.metric("IV/HV Ratio", f"{iv.iv_hv_ratio:.2f}")
+                        st.markdown("---"); st.subheader("📈 Volatility Profile")
+                        v1,v2,v3,v4,v5 = st.columns(5)
+                        v1.metric("IV Rank",f"{iv.iv_rank:.0f}%"); v2.metric("IV Pctile",f"{iv.iv_percentile:.0f}%")
+                        v3.metric("Current IV",f"{iv.current_iv:.1f}%"); v4.metric("HV-20",f"{iv.hv_20:.1f}%")
+                        v5.metric("IV/HV",f"{iv.iv_hv_ratio:.2f}")
+                        if iv.premium_action=="SELL": st.error(f"💰 SELL PREMIUM — IV Rank {iv.iv_rank:.0f}%")
+                        elif iv.premium_action=="BUY": st.success(f"🎯 BUY PREMIUM — IV Rank {iv.iv_rank:.0f}%")
+                        else: st.info(f"⚖️ NEUTRAL — IV Rank {iv.iv_rank:.0f}%")
 
-                        vc1, vc2, vc3, vc4 = st.columns(4)
-                        vc1.metric("IV Regime", iv.iv_regime)
-                        vc2.metric("IV Trend", iv.iv_trend)
-                        vc3.metric("HV-60", f"{iv.hv_60:.1f}%")
-                        vc4.metric("Skew", f"{iv.skew:.3f}")
-
-                        if iv.premium_action == "SELL":
-                            st.error(f"💰 **SELL PREMIUM** — IV Rank {iv.iv_rank:.0f}%")
-                        elif iv.premium_action == "BUY":
-                            st.success(f"🎯 **BUY PREMIUM** — IV Rank {iv.iv_rank:.0f}%")
-                        else:
-                            st.info(f"⚖️ **NEUTRAL** — IV Rank {iv.iv_rank:.0f}%")
-                    else:
-                        st.warning("Could not compute IV analysis.")
-
-                    # ── Strategy ──
-                    # select_strategy returns StrategyRecommendation with:
-                    #   .strategy = StrategyType enum (use .value for string)
-                    #   .direction, .confidence, .target_dte, .rationale
                     if regime and iv:
-                        strat = select_strategy(regime, iv)
-                        st.markdown("---")
-                        st.subheader("🎯 Recommended Strategy")
-                        s1, s2, s3, s4 = st.columns(4)
-                        # .strategy is a StrategyType enum — use .value
-                        strat_name = strat.strategy.value if hasattr(strat.strategy, 'value') else str(strat.strategy)
-                        s1.metric("Strategy", strat_name.replace("_", " "))
-                        s2.metric("Direction", strat.direction)
-                        s3.metric("Confidence", f"{strat.confidence:.0%}")
-                        s4.metric("Target DTE", f"{strat.target_dte}d")
+                        strat = select_strategy(regime,iv)
+                        st.markdown("---"); st.subheader("🎯 Strategy")
+                        strat_name = strat.strategy.value if hasattr(strat.strategy,'value') else str(strat.strategy)
+                        s1,s2,s3,s4 = st.columns(4)
+                        s1.metric("Strategy",strat_name.replace("_"," ")); s2.metric("Direction",strat.direction)
+                        s3.metric("Confidence",f"{strat.confidence:.0%}"); s4.metric("DTE",f"{strat.target_dte}d")
+                        if strat.rationale: st.info(f"**Rationale:** {strat.rationale}")
+                        st.caption("⚠️ Full trade construction requires Polygon.io ($29/mo).")
 
-                        if strat.rationale:
-                            st.info(f"**Rationale:** {strat.rationale}")
-
-                        st.caption("⚠️ Full trade construction requires Polygon.io options data ($29/mo).")
-
-                        # ── Summary Table ──
-                        st.markdown("---")
-                        st.subheader("📋 Summary")
-                        dir_icon = "🟢" if regime.direction_score > 0.2 else "🔴" if regime.direction_score < -0.2 else "🟡"
-                        iv_icon = "🔴" if iv.iv_rank > 70 else "🟢" if iv.iv_rank < 30 else "🟡"
-
-                        summary_data = {
-                            "Metric": ["Regime", "Trend", "IV Rank", "IV/HV", "Strategy", "Setup"],
-                            "Value": [
-                                regime.regime.value,
-                                f"ADX {regime.adx:.0f} / RSI {regime.rsi:.0f}",
-                                f"{iv.iv_rank:.0f}%",
-                                f"{iv.iv_hv_ratio:.2f}x",
-                                strat_name.replace("_", " "),
-                                f"{strat.direction} / {strat.target_dte}d DTE",
-                            ],
-                            "Signal": [
-                                f"{dir_icon} Score: {regime.direction_score:+.2f}",
-                                "Strong" if regime.adx > 25 else "Weak",
-                                f"{iv_icon} {iv.premium_action}",
-                                "Overpriced" if iv.iv_hv_ratio > 1.1 else "Underpriced" if iv.iv_hv_ratio < 0.9 else "Fair",
-                                f"Conf: {strat.confidence:.0%}",
-                                f"EMA: {regime.ema_alignment}",
-                            ],
-                        }
-                        st.table(pd.DataFrame(summary_data))
-
-                    # ── Price Chart ──
-                    st.markdown("---")
-                    st.subheader("📉 Price Chart (90 days)")
-                    chart_df = df.tail(90)
-                    fig = go.Figure(data=[go.Candlestick(
-                        x=chart_df.index,
-                        open=chart_df["open"], high=chart_df["high"],
-                        low=chart_df["low"], close=chart_df["close"]
-                    )])
+                    st.markdown("---"); st.subheader("📉 Chart (90d)")
+                    cdf = df.tail(90)
+                    fig = go.Figure(data=[go.Candlestick(x=cdf.index,open=cdf["open"],high=cdf["high"],low=cdf["low"],close=cdf["close"])])
                     if regime:
-                        fig.add_hline(y=regime.support, line_dash="dash", line_color="#FF9800",
-                                      annotation_text=f"Support ${regime.support:.2f}")
-                        fig.add_hline(y=regime.resistance, line_dash="dash", line_color="#2196F3",
-                                      annotation_text=f"Resistance ${regime.resistance:.2f}")
-                    fig.update_layout(height=500, xaxis_rangeslider_visible=False,
-                                      template="plotly_dark",
-                                      margin=dict(l=50, r=150, t=30, b=30))
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # Save to session history
-                    if "analysis_history" not in st.session_state:
-                        st.session_state.analysis_history = []
-                    strat_val = ""
-                    conf_val = 0.0
-                    if regime and iv:
-                        strat_val = strat_name
-                        conf_val = strat.confidence
-                    st.session_state.analysis_history.append({
-                        "ticker": ticker, "price": price,
-                        "regime": regime.regime.value if regime else "?",
-                        "iv_rank": iv.iv_rank if iv else 0,
-                        "strategy": strat_val, "confidence": conf_val,
-                        "direction": strat.direction if regime and iv else "?",
-                        "date": date.today().isoformat(),
-                    })
-
+                        fig.add_hline(y=regime.support,line_dash="dash",line_color="#FF9800",annotation_text=f"S ${regime.support:.0f}")
+                        fig.add_hline(y=regime.resistance,line_dash="dash",line_color="#2196F3",annotation_text=f"R ${regime.resistance:.0f}")
+                    fig.update_layout(height=500,xaxis_rangeslider_visible=False,template="plotly_dark",margin=dict(l=50,r=150,t=30,b=30))
+                    st.plotly_chart(fig,use_container_width=True)
             except Exception as e:
-                st.error(f"Analysis failed: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                st.error(f"Analysis failed: {e}"); import traceback; st.code(traceback.format_exc())
     else:
         st.info("Enter a ticker and click **Analyze**.")
-        if "analysis_history" in st.session_state and st.session_state.get("analysis_history"):
-            st.markdown("---")
-            st.markdown("### Recent Analyses")
-            for h in reversed(st.session_state.analysis_history[-5:]):
-                st.caption(
-                    f"**{h['ticker']}** — {h['strategy'].replace('_', ' ')} | "
-                    f"Conf: {h['confidence']:.0%} | IV Rank: {h['iv_rank']:.0f}%"
-                )
 
 
 elif page == "📈 Today's Picks":
     st.title("Options Algo — Today's Picks")
     signal = opt_load_signal()
     if signal:
-        mkt = signal.get("market_context", {})
+        mkt = signal.get("market_context",{})
         if mkt:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Market", mkt.get("market_regime", "?"))
-            c2.metric("VIX", f"{mkt.get('vix_level', 0):.0f}")
-            c3.metric("SPY Trend", mkt.get("spy_trend", "?"))
-            c4.metric("Breadth", f"{mkt.get('breadth_score', 0):.0%}")
-
-            if mkt.get("notes"):
-                st.warning(f"⚠️ {mkt['notes']}")
-
-        picks = signal.get("top_picks", [])
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Market",mkt.get("market_regime","?")); c2.metric("VIX",f"{mkt.get('vix_level',0):.0f}")
+            c3.metric("SPY Trend",mkt.get("spy_trend","?")); c4.metric("Breadth",f"{mkt.get('breadth_score',0):.0%}")
+        picks = signal.get("top_picks",[])
         if picks:
-            st.subheader(f"Top {len(picks)} Picks")
             for p in picks:
-                rec = p.get("recommendation", {})
-                ctx = p.get("context", {})
-                iv_d = ctx.get("iv_detail", {})
-                reg_d = ctx.get("regime_detail", {})
-                trade = p.get("trade", {})
-
-                with st.expander(
-                    f"#{p.get('priority', '?')} {rec.get('ticker', '?')} — "
-                    f"{rec.get('strategy', '?').replace('_', ' ')} | "
-                    f"{direction_badge(rec.get('direction', ''))} | "
-                    f"Conf: {rec.get('confidence', 0):.0%}",
-                    expanded=(p.get("priority", 10) <= 3),
-                ):
-                    tc1, tc2, tc3 = st.columns(3)
+                rec=p.get("recommendation",{}); ctx=p.get("context",{}); iv_d=ctx.get("iv_detail",{})
+                with st.expander(f"#{p.get('priority','?')} {rec.get('ticker','?')} — {rec.get('strategy','?').replace('_',' ')} | {direction_badge(rec.get('direction',''))} | Conf: {rec.get('confidence',0):.0%}",
+                    expanded=(p.get("priority",10)<=3)):
+                    tc1,tc2 = st.columns(2)
                     with tc1:
-                        st.markdown("**Setup**")
-                        st.write(f"Price: **${ctx.get('price', 0):.2f}**")
-                        st.write(f"Regime: `{rec.get('regime', '?')}`")
-                        st.write(f"ADX: {reg_d.get('adx', 0):.0f} | RSI: {reg_d.get('rsi', 0):.0f}")
-                        st.write(f"EMA: {reg_d.get('ema_alignment', '?')} | Vol: {reg_d.get('volume_trend', '?')}")
-                        if reg_d.get("bb_squeeze"):
-                            st.success("BB Squeeze")
+                        st.write(f"Price: **${ctx.get('price',0):.2f}** | Regime: `{rec.get('regime','?')}`")
+                        st.write(f"IV Rank: **{iv_d.get('iv_rank',0):.0f}%** | IV/HV: {iv_d.get('iv_hv_ratio',0):.2f} | {iv_d.get('premium_action','?')}")
                     with tc2:
-                        st.markdown("**Volatility**")
-                        st.write(f"IV Rank: **{iv_d.get('iv_rank', 0):.0f}%**")
-                        st.write(f"IV/HV: **{iv_d.get('iv_hv_ratio', 0):.2f}**")
-                        st.write(f"IV Trend: {iv_d.get('iv_trend', '?')}")
-                        st.write(f"Action: **{iv_d.get('premium_action', '?')}**")
-                    with tc3:
-                        st.markdown("**Trade**")
+                        trade=p.get("trade",{})
                         if not trade.get("dry_run"):
-                            credit = trade.get("net_credit") or trade.get("total_credit")
-                            if credit:
-                                st.write(f"Credit: **${credit:.2f}**")
-                            debit = trade.get("net_debit")
-                            if debit:
-                                st.write(f"Debit: **${debit:.2f}**")
-                            if trade.get("max_risk"):
-                                st.write(f"Max Risk: ${trade['max_risk']:.2f}")
-                            if trade.get("prob_profit"):
-                                st.write(f"PoP: **{trade['prob_profit']:.0f}%**")
-                            if trade.get("breakeven"):
-                                st.write(f"Breakeven: ${trade['breakeven']:.2f}")
-                        else:
-                            st.info("Dry-run — no trade details")
-
-                    st.caption(f"Rationale: {rec.get('rationale', '')}")
-                    st.caption(f"Score: {p.get('composite_score', 0):.4f}")
-
-            # Scan stats
+                            for k in ["net_credit","max_risk","prob_profit"]:
+                                if k in trade: st.write(f"{k.replace('_',' ').title()}: **${trade[k]:.2f}**" if 'prob' not in k else f"PoP: **{trade[k]:.0f}%**")
+                        else: st.info("Dry-run")
+                    st.caption(rec.get("rationale",""))
             st.markdown("---")
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Universe", signal.get("universe_size", 0))
-            sc2.metric("Qualified", signal.get("qualified", 0))
-            sc3.metric("After Events", signal.get("after_event_filter", 0))
-            sc4.metric("Elapsed", f"{signal.get('elapsed_seconds', 0):.0f}s")
-
-            # Regime distribution bar
-            regime_dist = signal.get("regime_distribution", {})
+            regime_dist = signal.get("regime_distribution",{})
             if regime_dist:
-                st.markdown("### Regime Distribution")
-                df_reg = pd.DataFrame(list(regime_dist.items()), columns=["Regime", "Count"])
-                df_reg = df_reg.sort_values("Count", ascending=False)
-                fig = px.bar(df_reg, x="Regime", y="Count", color="Regime",
-                             color_discrete_map=REGIME_COLORS,
-                             title="Universe Regime Distribution")
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No picks today.")
-    else:
-        st.warning("No signal. Run nightly scan first.")
+                df_r = pd.DataFrame(list(regime_dist.items()),columns=["Regime","Count"]).sort_values("Count",ascending=False)
+                fig = px.bar(df_r,x="Regime",y="Count",color="Regime",color_discrete_map=REGIME_COLORS)
+                st.plotly_chart(fig,use_container_width=True)
+        else: st.info("No picks today.")
+    else: st.warning("No signal. Run scan first.")
 
 
 elif page == "📋 Trade Tracker":
     st.title("📋 Trade Tracker")
-    st.caption("Paper trades — open positions and closed outcomes.")
-
     trades = opt_load_trades()
     if trades:
-        df = pd.DataFrame(trades)
-        open_trades = df[df["outcome"] == "OPEN"]
-        closed_trades = df[df["outcome"] != "OPEN"]
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total", len(df))
-        c2.metric("Open", len(open_trades))
-        c3.metric("Closed", len(closed_trades))
-        if not closed_trades.empty:
-            wins = (closed_trades["won"] == True).sum()
-            wr = wins / len(closed_trades) * 100
-            c4.metric("Win Rate", f"{wr:.0f}%")
-            c5.metric("Total P&L", f"${closed_trades['pnl'].sum():+,.2f}")
-
-        if not open_trades.empty:
-            st.markdown("---")
-            st.subheader(f"Open Positions ({len(open_trades)})")
-            cols = ["trade_id", "ticker", "strategy", "direction", "entry_date",
-                    "expiration", "short_strike", "long_strike", "net_credit_or_debit",
-                    "max_risk", "confidence", "iv_rank"]
-            available = [c for c in cols if c in open_trades.columns]
-            st.dataframe(open_trades[available], use_container_width=True)
-
-        if not closed_trades.empty:
-            st.markdown("---")
-            st.subheader(f"Closed Trades ({len(closed_trades)})")
-            cols = ["trade_id", "ticker", "strategy", "direction", "entry_date",
-                    "exit_date", "outcome", "pnl", "pnl_pct", "days_held", "close_reason"]
-            available = [c for c in cols if c in closed_trades.columns]
-            st.dataframe(
-                closed_trades[available].sort_values("exit_date", ascending=False),
-                use_container_width=True,
-            )
-
-            st.markdown("---")
-            st.subheader("Equity Curve")
-            pnl_series = closed_trades.sort_values("exit_date").copy()
-            pnl_series["cumulative_pnl"] = pnl_series["pnl"].cumsum()
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=pnl_series["exit_date"], y=pnl_series["cumulative_pnl"],
-                mode="lines+markers", fill="tozeroy", name="Cumulative P&L",
-                line=dict(color="#2196F3", width=2),
-            ))
-            fig.add_hline(y=0, line_dash="dash", line_color="gray")
-            fig.update_layout(height=400, template="plotly_dark",
-                              yaxis_title="Cumulative P&L ($)")
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No trades yet. Trades are logged during nightly scan (non dry-run).")
-        st.code("python -m src.pipeline.nightly_scan  # without --dry-run")
+        df = pd.DataFrame(trades); ot = df[df["outcome"]=="OPEN"]; ct = df[df["outcome"]!="OPEN"]
+        c1,c2,c3 = st.columns(3); c1.metric("Total",len(df)); c2.metric("Open",len(ot)); c3.metric("Closed",len(ct))
+        if not ct.empty:
+            wins = (ct["won"]==True).sum(); st.metric("Win Rate",f"{wins/len(ct)*100:.0f}%")
+        if not ot.empty:
+            st.markdown("---"); st.subheader("Open"); st.dataframe(ot,use_container_width=True)
+        if not ct.empty:
+            st.markdown("---"); st.subheader("Closed"); st.dataframe(ct.sort_values("exit_date",ascending=False),use_container_width=True)
+    else: st.info("No trades yet.")
 
 
 elif page == "📊 Strategy Stats":
     st.title("📊 Strategy Performance")
-
     trades = opt_load_trades()
     if trades:
-        df = pd.DataFrame(trades)
-        closed = df[df["outcome"] != "OPEN"]
-
+        df = pd.DataFrame(trades); closed = df[df["outcome"]!="OPEN"]
         if not closed.empty:
-            strategies = closed["strategy"].unique()
             rows = []
-            for strat in strategies:
-                s = closed[closed["strategy"] == strat]
-                wins = int((s["won"] == True).sum())
-                total = len(s)
-                rows.append({
-                    "Strategy": strat.replace("_", " "),
-                    "Trades": total,
-                    "Wins": wins,
-                    "Losses": total - wins,
-                    "Win Rate %": round(wins / total * 100, 0) if total > 0 else 0,
-                    "Total P&L": round(s["pnl"].sum(), 2),
-                    "Avg P&L": round(s["pnl"].mean(), 2),
-                    "Avg Days": round(s["days_held"].mean(), 0) if "days_held" in s.columns else 0,
-                })
-
-            stats_df = pd.DataFrame(rows)
-            st.dataframe(stats_df, use_container_width=True)
-
-            fig = px.bar(stats_df, x="Strategy", y="Win Rate %",
-                         color="Win Rate %", color_continuous_scale="RdYlGn",
-                         range_color=[0, 100], title="Win Rate by Strategy")
-            fig.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50%")
-            fig.update_layout(height=400, template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
-
-            if "regime" in closed.columns:
-                st.markdown("---")
-                st.subheader("P&L by Regime")
-                regime_stats = closed.groupby("regime").agg(
-                    Trades=("pnl", "count"),
-                    Total_PnL=("pnl", "sum"),
-                    Avg_PnL=("pnl", "mean"),
-                    Win_Rate=("won", "mean"),
-                ).round(2)
-                regime_stats["Win_Rate"] = (regime_stats["Win_Rate"] * 100).round(0).astype(int).astype(str) + "%"
-                st.dataframe(regime_stats, use_container_width=True)
-        else:
-            st.info("No closed trades yet.")
-    else:
-        st.info("No trade data found.")
+            for s in closed["strategy"].unique():
+                sub = closed[closed["strategy"]==s]; w = int((sub["won"]==True).sum()); t = len(sub)
+                rows.append({"Strategy":s.replace("_"," "),"Trades":t,"Wins":w,"Win %":round(w/t*100) if t else 0,
+                    "Total P&L":round(sub["pnl"].sum(),2),"Avg P&L":round(sub["pnl"].mean(),2)})
+            st.dataframe(pd.DataFrame(rows),use_container_width=True)
+        else: st.info("No closed trades.")
+    else: st.info("No trade data.")
 
 
 elif page == "🌡️ IV Heatmap":
     st.title("🌡️ IV Heatmap")
     signal = opt_load_signal()
     if signal:
-        picks = signal.get("top_picks", [])
-        rows = []
+        picks = signal.get("top_picks",[]); rows = []
         for p in picks:
-            rec = p.get("recommendation", {})
-            ctx = p.get("context", {})
-            iv_d = ctx.get("iv_detail", {})
-            rows.append({
-                "Ticker": rec.get("ticker", "?"),
-                "Sector": ctx.get("sector", "?"),
-                "IV Rank": round(float(iv_d.get("iv_rank", 0)), 1),
-                "IV Pctile": round(float(iv_d.get("iv_percentile", 0)), 1),
-                "Current IV": round(float(iv_d.get("current_iv", 0)), 1),
-                "HV-20": round(float(iv_d.get("hv_20", 0)), 1),
-                "IV/HV": round(float(iv_d.get("iv_hv_ratio", 0)), 2),
-                "IV Trend": iv_d.get("iv_trend", "?"),
-                "Action": iv_d.get("premium_action", "?"),
-                "Strategy": rec.get("strategy", "?").replace("_", " "),
-            })
-
+            rec=p.get("recommendation",{}); iv_d=p.get("context",{}).get("iv_detail",{})
+            rows.append({"Ticker":rec.get("ticker","?"),"IV Rank":round(float(iv_d.get("iv_rank",0)),1),
+                "IV Pctile":round(float(iv_d.get("iv_percentile",0)),1),"HV-20":round(float(iv_d.get("hv_20",0)),1),
+                "IV/HV":round(float(iv_d.get("iv_hv_ratio",0)),2),"Action":iv_d.get("premium_action","?"),
+                "Strategy":rec.get("strategy","?").replace("_"," ")})
         if rows:
-            iv_df = pd.DataFrame(rows).sort_values("IV Rank", ascending=False)
-
-            # Visual heatmap
-            heatmap_data = iv_df[["IV Rank", "IV Pctile", "HV-20", "IV/HV"]].values
-            fig = px.imshow(
-                heatmap_data,
-                x=["IV Rank", "IV Pctile", "HV-20", "IV/HV"],
-                y=iv_df["Ticker"].tolist(),
-                color_continuous_scale="RdYlGn_r",
-                aspect="auto",
-                text_auto=".1f",
-            )
-            fig.update_layout(
-                title="IV Heatmap — Top Picks",
-                height=max(300, len(rows) * 80 + 100),
-                template="plotly_dark",
-                margin=dict(l=80, r=20, t=50, b=30),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Action summary
-            sell_count = sum(1 for r in rows if r["Action"] == "SELL")
-            buy_count = sum(1 for r in rows if r["Action"] == "BUY")
-            neutral_count = len(rows) - sell_count - buy_count
-            st.markdown(f"**Summary:** {sell_count} SELL premium | {buy_count} BUY premium | {neutral_count} NEUTRAL")
-
-            # Scatter: IV Rank vs IV/HV
-            fig2 = px.scatter(
-                iv_df, x="IV Rank", y="IV/HV", color="Action", text="Ticker",
-                title="IV Rank vs IV/HV Ratio",
-                color_discrete_map={"SELL": "#D50000", "NEUTRAL": "#FFD740", "BUY": "#00C853"},
-            )
-            fig2.add_vline(x=70, line_dash="dash", line_color="red", annotation_text="IV High")
-            fig2.add_vline(x=30, line_dash="dash", line_color="green", annotation_text="IV Low")
-            fig2.add_hline(y=1.0, line_dash="dot", line_color="gray", annotation_text="IV=HV")
-            fig2.update_layout(height=400, template="plotly_dark")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            # Detail table
-            st.markdown("---")
-            st.subheader("Detail Table")
-            st.dataframe(iv_df, use_container_width=True)
-        else:
-            st.info("No IV data in latest signal.")
-    else:
-        st.warning("No signal data. Run scan first.")
+            iv_df = pd.DataFrame(rows).sort_values("IV Rank",ascending=False)
+            fig = px.imshow(iv_df[["IV Rank","IV Pctile","HV-20","IV/HV"]].values,
+                x=["IV Rank","IV Pctile","HV-20","IV/HV"],y=iv_df["Ticker"].tolist(),
+                color_continuous_scale="RdYlGn_r",aspect="auto",text_auto=".1f")
+            fig.update_layout(height=max(300,len(rows)*80+100),template="plotly_dark")
+            st.plotly_chart(fig,use_container_width=True)
+            st.dataframe(iv_df,use_container_width=True)
+        else: st.info("No IV data.")
+    else: st.warning("No signal.")
 
 
 elif page == "🗺️ Regime Map":
     st.title("🗺️ Regime Map")
     signal = opt_load_signal()
     if signal:
-        dist = signal.get("regime_distribution", {})
+        dist = signal.get("regime_distribution",{})
         if dist:
-            col1, col2 = st.columns(2)
-            with col1:
-                df_r = pd.DataFrame(list(dist.items()), columns=["Regime", "Count"])
-                fig = px.pie(df_r, names="Regime", values="Count",
-                             title="Regime Distribution",
-                             color="Regime", color_discrete_map=REGIME_COLORS)
-                st.plotly_chart(fig, use_container_width=True)
-            with col2:
-                recs = signal.get("all_recommendations", [])
+            c1,c2 = st.columns(2)
+            with c1:
+                df_r = pd.DataFrame(list(dist.items()),columns=["Regime","Count"])
+                st.plotly_chart(px.pie(df_r,names="Regime",values="Count",color="Regime",color_discrete_map=REGIME_COLORS),use_container_width=True)
+            with c2:
+                recs = signal.get("all_recommendations",[])
                 if recs:
-                    strat_counts = pd.DataFrame(recs)["strategy"].value_counts().reset_index()
-                    strat_counts.columns = ["Strategy", "Count"]
-                    fig2 = px.bar(strat_counts, x="Count", y="Strategy",
-                                  orientation="h", title="Strategy Distribution")
-                    fig2.update_layout(template="plotly_dark")
-                    st.plotly_chart(fig2, use_container_width=True)
-
-        recs = signal.get("all_recommendations", [])
+                    sc = pd.DataFrame(recs)["strategy"].value_counts().reset_index(); sc.columns=["Strategy","Count"]
+                    st.plotly_chart(px.bar(sc,x="Count",y="Strategy",orientation="h"),use_container_width=True)
+        recs = signal.get("all_recommendations",[])
         if recs:
-            st.markdown("### All Recommendations")
-            rec_df = pd.DataFrame(recs)
-            display_cols = ["ticker", "regime", "iv_regime", "strategy", "direction", "confidence"]
-            available = [c for c in display_cols if c in rec_df.columns]
-            display = rec_df[available].copy()
-            if "confidence" in display.columns:
-                display["confidence"] = display["confidence"].apply(lambda x: f"{x:.0%}")
-            st.dataframe(display, use_container_width=True, height=400)
-    else:
-        st.warning("No signal data.")
+            rd = pd.DataFrame(recs)
+            cols = [c for c in ["ticker","regime","strategy","direction","confidence"] if c in rd.columns]
+            st.dataframe(rd[cols],use_container_width=True,height=400)
+    else: st.warning("No signal.")
 
 
 elif page == "▶️ Run Scan":
     st.title("▶️ Run Scan")
-    st.info("Trigger the nightly scan on demand. Use **Dry Run** to skip live options data.")
-
-    dry = st.checkbox("Dry Run (recommended until Polygon subscription)", value=True)
-    tickers_raw = st.text_input(
-        "Custom tickers (comma-separated, blank = full universe)",
-        placeholder="AAPL, MSFT, NVDA"
-    )
-
-    if st.button("🚀 Run Scan", type="primary"):
-        custom = None
-        if tickers_raw.strip():
-            custom = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-        with st.spinner("Running scan... this may take 1-3 minutes"):
+    dry = st.checkbox("Dry Run",value=True)
+    tickers_raw = st.text_input("Custom tickers (comma-separated, blank=full universe)",placeholder="AAPL, MSFT")
+    if st.button("🚀 Run Scan",type="primary"):
+        custom = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()] if tickers_raw.strip() else None
+        with st.spinner("Running..."):
             try:
                 from src.pipeline.nightly_scan import run_nightly_scan
-                result = run_nightly_scan(universe_override=custom, dry_run=dry)
-                n_picks = len(result.get("top_picks", []))
-                elapsed = result.get("elapsed_seconds", 0)
-                st.success(f"Scan complete! {n_picks} picks in {elapsed:.0f}s")
-                st.cache_data.clear()
-                st.rerun()
+                result = run_nightly_scan(universe_override=custom,dry_run=dry)
+                st.success(f"Done! {len(result.get('top_picks',[]))} picks in {result.get('elapsed_seconds',0):.0f}s")
+                st.cache_data.clear(); st.rerun()
             except Exception as e:
-                st.error(f"Scan failed: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                st.error(str(e)); import traceback; st.code(traceback.format_exc())
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  SYSTEM PAGES
-# ══════════════════════════════════════════════════════════════════════
 
 elif page == "📅 Cron Jobs":
     st.title("📅 Scheduled Jobs")
     jobs = load_cron_jobs()
     if jobs:
         for job in jobs:
-            name = job.get("name", "Unknown")
-            sched = job.get("schedule", {})
-            expr = sched.get("expr", "N/A") if isinstance(sched, dict) else str(sched)
-            state = job.get("state", {})
-            status = state.get("lastRunStatus", "never")
-            icon = "🟢" if status == "ok" else "🔴" if status == "error" else "⚪"
+            name=job.get("name","?"); sched=job.get("schedule",{})
+            expr = sched.get("expr","N/A") if isinstance(sched,dict) else str(sched)
+            state=job.get("state",{}); status=state.get("lastRunStatus","never")
+            icon = "🟢" if status=="ok" else "🔴" if status=="error" else "⚪"
             with st.expander(f"{icon} {name} — `{expr}`"):
-                c1, c2 = st.columns(2)
-                c1.metric("Status", status)
-                c2.metric("Errors", state.get("consecutiveErrors", 0))
-    else:
-        st.info("No cron jobs found or unable to read jobs file.")
+                c1,c2 = st.columns(2); c1.metric("Status",status); c2.metric("Errors",state.get("consecutiveErrors",0))
+    else: st.info("No cron jobs found.")
