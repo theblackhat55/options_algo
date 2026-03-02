@@ -30,6 +30,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+from src.pipeline.outcome_tracker import record_entry
+
 from config.settings import (
     SIGNALS_DIR, MAX_POSITIONS,
     MIN_STOCK_PRICE, MIN_AVG_VOLUME, LOG_LEVEL,
@@ -440,4 +442,17 @@ if __name__ == "__main__":
             if credit:
                 print(f"   Credit: ${credit} | Max Risk: ${max_r} | PoP: {pop}%")
         print(f"   {rec['rationale']}")
+
+        # Log paper trade
+        if not trade.get("dry_run"):
+            try:
+                tid = record_entry(
+                    ticker=rec["ticker"],
+                    recommendation=rec,
+                    trade=trade,
+                    context=ctx,
+                )
+                print(f"   📝 Trade logged: {tid}")
+            except Exception as e:
+                print(f"   ⚠️ Trade logging failed: {e}")
     print()
