@@ -229,93 +229,94 @@ if page == "🏠 Overview":
 elif page == "📈 Backtest":
     st.title("Backtest Dashboard — Predictions vs Actuals")
     replay = spx_load_replay()
+    spx = spx_load_data()
 
     if not replay.empty:
+        st.subheader("Prediction vs Actual (Jan–Feb 2026)")
         replay["date"] = pd.to_datetime(replay["date"])
         dates = replay["date"]
 
-        # ── Summary Metrics ──
-        m1, m2, m3, m4, m5 = st.columns(5)
-        wins = len(replay[replay["condor"] == "WIN"])
-        total = len(replay)
-        total_pnl = replay["net_pnl_dollars"].sum()
-        equity = replay["net_pnl_dollars"].cumsum()
-        max_dd = (equity - equity.cummax()).min()
-        m1.metric("Win Rate", f"{wins/total*100:.1f}%", f"{wins}/{total} trades")
-        m2.metric("Total P&L", f"${total_pnl:,.0f}")
-        m3.metric("Max Drawdown", f"${max_dd:,.0f}")
-        m4.metric("Avg High Err", f"{replay['h_err_pct'].mean():.3f}%")
-        m5.metric("Avg Low Err", f"{replay['l_err_pct'].mean():.3f}%")
+        # Enrich with actual OHLC from SPX if missing
+        if "actual_high" not in replay.columns and not spx.empty:
+            spx_aligned = spx.reindex(dates)
+            replay["actual_high"] = spx_aligned["High"].values
+            replay["actual_low"] = spx_aligned["Low"].values
+            replay["actual_close"] = spx_aligned["Close"].values
 
-        st.markdown("---")
+        if "prior_close" not in replay.columns and not spx.empty:
+            prior_closes = []
+            for d in dates:
+                if d in spx.index:
+                    loc = spx.index.get_loc(d)
+                    prior_closes.append(float(spx["Close"].iloc[loc - 1]) if loc > 0 else np.nan)
+                else:
+                    prior_closes.append(np.nan)
+            replay["prior_close"] = prior_closes
 
-        # ── Chart 1: Predicted vs Actual (clean, readable) ──
-        st.subheader("Predicted vs Actual High / Low")
-        fig1 = go.Figure()
+        if "pred_high" not in replay.columns and "h_err_pct" in replay.columns:
+            replay["pred_high"] = replay["actual_high"] + (replay["h_err_pct"] / 100 * replay["prior_close"])
+            replay["pred_low"] = replay["actual_low"] + (replay["l_err_pct"] / 100 * replay["prior_close"])
 
-        # Actual High — solid green
-        fig1.add_trace(go.Scatter(x=dates, y=replay["actual_high"],
-            mode="lines", name="Actual High",
-            line=dict(color="#26a69a", width=2)))
+        # ── 3-Panel Chart (original style) ──
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            subplot_titles=("SPX: Predicted vs Actual High/Low", "Prediction Error (%)", "Equity Curve ($)"),
+            row_heights=[0.45, 0.25, 0.30])
 
-        # Actual Low — solid lighter green
-        fig1.add_trace(go.Scatter(x=dates, y=replay["actual_low"],
-            mode="lines", name="Actual Low",
-            line=dict(color="#66bb6a", width=2)))
+        # Panel 1: Candlestick + predicted dotted lines
+        fig.add_trace(go.Candlestick(
+            x=dates, open=replay["prior_close"], high=replay["actual_high"],
+            low=replay["actual_low"], close=replay["actual_close"],
+            name="Actual OHLC",
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        ), row=1, col=1)
 
-        # Predicted High — blue dotted
-        fig1.add_trace(go.Scatter(x=dates, y=replay["pred_high"],
-            mode="lines+markers", name="Predicted High",
-            line=dict(color="#2196F3", width=2, dash="dot"),
-            marker=dict(size=5, color="#2196F3")))
+        if "pred_high" in replay.columns:
+            fig.add_trace(go.Scatter(
+                x=dates, y=replay["pred_high"], mode="lines+markers",
+                name="Predicted High",
+                line=dict(color="#2196F3", width=2, dash="dot"),
+                marker=dict(size=5),
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=dates, y=replay["pred_low"], mode="lines+markers",
+                name="Predicted Low",
+                line=dict(color="#FF9800", width=2, dash="dot"),
+                marker=dict(size=5),
+            ), row=1, col=1)
 
-        # Predicted Low — red dotted
-        fig1.add_trace(go.Scatter(x=dates, y=replay["pred_low"],
-            mode="lines+markers", name="Predicted Low",
-            line=dict(color="#ef5350", width=2, dash="dot"),
-            marker=dict(size=5, color="#ef5350")))
+        # Panel 2: Error bars
+        if "h_err_pct" in replay.columns:
+            colors_h = ["#ef5350" if e > 0.5 else "#26a69a" for e in replay["h_err_pct"]]
+            colors_l = ["#ef5350" if e > 0.5 else "#FF9800" for e in replay["l_err_pct"]]
+            fig.add_trace(go.Bar(x=dates, y=replay["h_err_pct"], name="High Error %",
+                marker_color=colors_h, opacity=0.7), row=2, col=1)
+            fig.add_trace(go.Bar(x=dates, y=-replay["l_err_pct"], name="Low Error %",
+                marker_color=colors_l, opacity=0.7), row=2, col=1)
+            fig.add_hline(y=0.5, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+            fig.add_hline(y=-0.5, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
 
-        fig1.update_layout(height=500, template="plotly_dark",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-            margin=dict(l=60, r=20, t=40, b=30),
-            yaxis_title="SPX Price", hovermode="x unified")
-        st.plotly_chart(fig1, use_container_width=True)
+        # Panel 3: Equity curve
+        if "net_pnl_dollars" in replay.columns:
+            equity = replay["net_pnl_dollars"].cumsum()
+            fig.add_trace(go.Scatter(x=dates, y=equity, mode="lines",
+                name="Cumulative P&L", line=dict(color="#2196F3", width=2),
+                fill="tozeroy", fillcolor="rgba(33,150,243,0.1)"), row=3, col=1)
+            loss_mask = replay["condor"] == "LOSS"
+            if loss_mask.any():
+                fig.add_trace(go.Scatter(x=dates[loss_mask], y=equity[loss_mask],
+                    mode="markers", name="Loss Days",
+                    marker=dict(color="red", size=10, symbol="x")), row=3, col=1)
 
-        # ── Chart 2: Prediction Error ──
-        st.subheader("Prediction Error (%)")
-        fig2 = go.Figure()
-        colors_h = ["#ef5350" if e > 0.5 else "#26a69a" for e in replay["h_err_pct"]]
-        colors_l = ["#ef5350" if e > 0.5 else "#FF9800" for e in replay["l_err_pct"]]
-        fig2.add_trace(go.Bar(x=dates, y=replay["h_err_pct"], name="High Error %",
-            marker_color=colors_h, opacity=0.8))
-        fig2.add_trace(go.Bar(x=dates, y=-replay["l_err_pct"], name="Low Error %",
-            marker_color=colors_l, opacity=0.8))
-        fig2.add_hline(y=0.5, line_dash="dash", line_color="red", opacity=0.5,
-            annotation_text="0.5% threshold")
-        fig2.add_hline(y=-0.5, line_dash="dash", line_color="red", opacity=0.5)
-        fig2.update_layout(height=300, template="plotly_dark", barmode="relative",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-            margin=dict(l=60, r=20, t=40, b=30),
-            yaxis_title="Error %", hovermode="x unified")
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # ── Chart 3: Equity Curve ──
-        st.subheader("Equity Curve")
-        fig3 = go.Figure()
-        equity_vals = replay["net_pnl_dollars"].cumsum()
-        fig3.add_trace(go.Scatter(x=dates, y=equity_vals, mode="lines",
-            name="Cumulative P&L", line=dict(color="#2196F3", width=2.5),
-            fill="tozeroy", fillcolor="rgba(33,150,243,0.1)"))
-        loss_mask = replay["condor"] == "LOSS"
-        if loss_mask.any():
-            fig3.add_trace(go.Scatter(x=dates[loss_mask], y=equity_vals[loss_mask],
-                mode="markers", name="Loss Days",
-                marker=dict(color="red", size=10, symbol="x")))
-        fig3.update_layout(height=300, template="plotly_dark",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-            margin=dict(l=60, r=20, t=40, b=30),
-            yaxis_title="Cumulative $", hovermode="x unified")
-        st.plotly_chart(fig3, use_container_width=True)
+        fig.update_layout(
+            height=900, showlegend=True, template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=50, r=20, t=60, b=30),
+            xaxis_rangeslider_visible=False)
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Error %", row=2, col=1)
+        fig.update_yaxes(title_text="Cumulative $", row=3, col=1)
+        st.plotly_chart(fig, use_container_width=True)
 
         # ── Day-by-Day Table ──
         st.markdown("---")
@@ -325,7 +326,7 @@ elif page == "📈 Backtest":
         for col, name in [("prior_close","Prior Close"), ("pred_high","Pred High"),
             ("actual_high","Actual High"), ("h_err_pct","High Err %"),
             ("pred_low","Pred Low"), ("actual_low","Actual Low"), ("l_err_pct","Low Err %"),
-            ("actual_close","Actual Close"), ("dir_correct","Dir OK"), ("regime","Regime"),
+            ("actual_close","Actual Close"), ("dir_correct","Dir Correct"), ("regime","Regime"),
             ("condor","Condor"), ("net_pnl_dollars","P&L ($)")]:
             if col in replay.columns:
                 table_cols.append(col)
@@ -340,8 +341,8 @@ elif page == "📈 Backtest":
             display_df["Low Err %"] = display_df["Low Err %"].map(lambda x: f"{x:.3f}%")
         if "P&L ($)" in display_df.columns:
             display_df["P&L ($)"] = display_df["P&L ($)"].map(lambda x: f"${x:+,.0f}")
-        if "Dir OK" in display_df.columns:
-            display_df["Dir OK"] = display_df["Dir OK"].map(lambda x: "✓" if x else "✗")
+        if "Dir Correct" in display_df.columns:
+            display_df["Dir Correct"] = display_df["Dir Correct"].map(lambda x: "\u2713" if x else "\u2717")
         if "Date" in display_df.columns:
             display_df["Date"] = pd.to_datetime(display_df["Date"]).dt.strftime("%Y-%m-%d")
         st.dataframe(display_df, use_container_width=True, height=600)
@@ -352,32 +353,27 @@ elif page == "📈 Backtest":
             st.markdown("---")
             st.subheader("Conformal Coverage Heatmap")
             cov_data = replay[["date"] + cov_cols].copy()
+            cov_data_str = cov_data.copy()
+            cov_data_str["date"] = cov_data_str["date"].dt.strftime("%Y-%m-%d")
             cov_matrix = cov_data[cov_cols].astype(int).T
-            cov_matrix.columns = cov_data["date"].dt.strftime("%Y-%m-%d")
+            cov_matrix.columns = cov_data_str["date"]
             cov_matrix.index = ["68% High", "68% Low", "90% High", "90% Low"]
-            fig_cov = go.Figure(data=go.Heatmap(
-                z=cov_matrix.values, x=cov_matrix.columns.tolist(),
-                y=cov_matrix.index.tolist(),
-                colorscale=[[0, "#ef5350"], [1, "#26a69a"]],
-                showscale=False, text=cov_matrix.values,
-                texttemplate="%{text}", textfont=dict(size=10)))
-            fig_cov.update_layout(height=200, margin=dict(l=100, r=20, t=20, b=40),
-                template="plotly_dark", xaxis=dict(tickangle=45))
-            st.plotly_chart(fig_cov, use_container_width=True)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("68% High", f"{replay['cov68h'].mean()*100:.1f}%")
-            c2.metric("68% Low", f"{replay['cov68l'].mean()*100:.1f}%")
-            c3.metric("90% High", f"{replay['cov90h'].mean()*100:.1f}%")
-            c4.metric("90% Low", f"{replay['cov90l'].mean()*100:.1f}%")
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=cov_matrix.values, x=cov_matrix.columns, y=cov_matrix.index,
+                colorscale=[[0, "#ef5350"], [1, "#26a69a"]], showscale=False))
+            fig_hm.update_layout(height=200, margin=dict(l=100, r=20, t=30, b=30), template="plotly_dark")
+            st.plotly_chart(fig_hm, use_container_width=True)
 
-        # ── Performance Statistics ──
+        # ── Statistics ──
         st.markdown("---")
         st.subheader("Performance Statistics")
         sc1, sc2, sc3, sc4 = st.columns(4)
         with sc1:
             st.markdown("**Prediction Accuracy**")
-            st.write(f"Mean High Error: {replay['h_err_pct'].mean():.4f}%")
-            st.write(f"Mean Low Error: {replay['l_err_pct'].mean():.4f}%")
+            if "h_err_pct" in replay.columns:
+                st.write(f"Mean High Error: {replay['h_err_pct'].mean():.4f}%")
+                st.write(f"Mean Low Error: {replay['l_err_pct'].mean():.4f}%")
+                st.write(f"Combined MAE: {(replay['h_err_pct'].mean()+replay['l_err_pct'].mean())/2:.4f}%")
         with sc2:
             st.markdown("**Direction**")
             if "dir_correct" in replay.columns:
@@ -385,20 +381,25 @@ elif page == "📈 Backtest":
                 st.write(f"Accuracy: {replay['dir_correct'].sum()}/{len(replay)} ({da:.1f}%)")
         with sc3:
             st.markdown("**Iron Condor**")
+            wins = len(replay[replay["condor"] == "WIN"])
+            total = len(replay)
             st.write(f"Win Rate: {wins}/{total} ({wins/total*100:.1f}%)")
-            st.write(f"Total P&L: ${total_pnl:,.2f}")
-            win_pnl = replay[replay["condor"]=="WIN"]["net_pnl_dollars"]
-            st.write(f"Avg Win: ${win_pnl.mean():,.2f}" if len(win_pnl)>0 else "N/A")
-            loss_df = replay[replay["condor"]=="LOSS"]
-            if len(loss_df)>0:
-                st.write(f"Avg Loss: ${loss_df['net_pnl_dollars'].mean():,.2f}")
+            if "net_pnl_dollars" in replay.columns:
+                st.write(f"Total P&L: ${replay['net_pnl_dollars'].sum():,.2f}")
+                win_pnl = replay[replay['condor']=='WIN']['net_pnl_dollars']
+                st.write(f"Avg Win: ${win_pnl.mean():,.2f}" if len(win_pnl)>0 else "Avg Win: N/A")
+                losses_df = replay[replay["condor"]=="LOSS"]
+                if len(losses_df)>0:
+                    st.write(f"Avg Loss: ${losses_df['net_pnl_dollars'].mean():,.2f}")
+                equity = replay["net_pnl_dollars"].cumsum()
+                st.write(f"Max DD: ${(equity-equity.cummax()).min():,.2f}")
         with sc4:
             st.markdown("**Coverage**")
             for col, label in [("cov68h","68% High"),("cov68l","68% Low"),("cov90h","90% High"),("cov90l","90% Low")]:
                 if col in replay.columns:
                     st.write(f"{label}: {replay[col].mean()*100:.1f}%")
     else:
-        st.warning("No replay data found. Run the replay script first.")
+        st.warning("No replay data found. Run the replay backtest first.")
 
 
 
