@@ -30,8 +30,8 @@ for _d in [RAW_DIR, PROCESSED_DIR, CALENDAR_DIR, SIGNALS_DIR,
 
 # ─── API Keys ─────────────────────────────────────────────────────────────────
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "your_finnhub_api_key_here")
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "your_alpha_vantage_key_here")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")           # Free tier: earnings calendar
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")        # Free tier: backup quotes
 TRADIER_API_KEY = os.getenv("TRADIER_API_KEY", "")          # Backup options data
 TRADIER_ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID", "")
 
@@ -87,7 +87,7 @@ WALK_FORWARD_STEP = int(os.getenv("WALK_FORWARD_STEP", "5"))
 MIN_TRADES_FOR_ML = int(os.getenv("MIN_TRADES_FOR_ML", "200"))
 
 # ─── Delivery ─────────────────────────────────────────────────────────────────
-WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "your_whatsapp_number_here")
+WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "")            # Set in .env
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

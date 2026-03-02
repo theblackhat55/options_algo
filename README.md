@@ -172,7 +172,7 @@ openclaw cron add \
   --tz UTC --exact \
   --session isolated \
   --message "Run the options algo nightly scan. Execute: sudo /root/options_algo/.venv/bin/python3 -m src.pipeline.nightly_scan. Show the top 5 picks with strategy, strikes, credit/debit, max risk, and probability of profit." \
-  --announce --channel whatsapp --to "your_whatsapp_number_here" \
+  --announce --channel whatsapp --to "$WHATSAPP_NUMBER" \
   --timeout-seconds 600
 
 # Morning brief — 9:00 AM ET (14:00 UTC) Mon-Fri
@@ -182,7 +182,7 @@ openclaw cron add \
   --tz UTC --exact \
   --session isolated \
   --message "Run: sudo /root/options_algo/.venv/bin/python3 -m src.pipeline.morning_brief. Send the formatted options picks for today via WhatsApp. Include all trade details." \
-  --announce --channel whatsapp --to "your_whatsapp_number_here" \
+  --announce --channel whatsapp --to "$WHATSAPP_NUMBER" \
   --timeout-seconds 120
 ```
 
