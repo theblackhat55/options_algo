@@ -228,143 +228,192 @@ if page == "🏠 Overview":
 # ══════════════════════════════════════════════════════════════════════
 elif page == "📈 Backtest":
     st.title("Backtest Dashboard — Predictions vs Actuals")
-    replay = spx_load_replay(); spx = spx_load_data()
+    replay = spx_load_replay()
 
     if not replay.empty:
         st.subheader("Prediction vs Actual (Jan–Feb 2026)")
+
+        # Ensure dates are datetime
+        replay["date"] = pd.to_datetime(replay["date"])
+
+        # All needed columns already exist in replay_jan_feb_2026_v2.csv
         dates = replay["date"]
 
-        # Enrich with actual OHLC from SPX
-        if "actual_high" not in replay.columns:
-            spx_aligned = spx.reindex(dates)
-            replay["actual_high"] = spx_aligned["High"].values
-            replay["actual_low"] = spx_aligned["Low"].values
-            replay["actual_close"] = spx_aligned["Close"].values
+        # ── Summary Metrics ──
+        m1, m2, m3, m4, m5 = st.columns(5)
+        wins = len(replay[replay["condor"] == "WIN"])
+        total = len(replay)
+        total_pnl = replay["net_pnl_dollars"].sum()
+        equity = replay["net_pnl_dollars"].cumsum()
+        max_dd = (equity - equity.cummax()).min()
+        avg_h_err = replay["h_err_pct"].mean()
+        avg_l_err = replay["l_err_pct"].mean()
 
-        if "prior_close" not in replay.columns:
-            prior_closes = []
-            for d in dates:
-                if d in spx.index:
-                    loc = spx.index.get_loc(d)
-                    prior_closes.append(float(spx["Close"].iloc[loc-1]) if loc>0 else np.nan)
-                else:
-                    prior_closes.append(np.nan)
-            replay["prior_close"] = prior_closes
+        m1.metric("Win Rate", f"{wins/total*100:.1f}%", f"{wins}/{total} trades")
+        m2.metric("Total P&L", f"${total_pnl:,.0f}")
+        m3.metric("Max Drawdown", f"${max_dd:,.0f}")
+        m4.metric("Avg High Err", f"{avg_h_err:.3f}%")
+        m5.metric("Avg Low Err", f"{avg_l_err:.3f}%")
 
-        if "pred_high" not in replay.columns and "h_err_pct" in replay.columns:
-            replay["pred_high"] = replay["actual_high"] + (replay["h_err_pct"]/100*replay["prior_close"])
-            replay["pred_low"] = replay["actual_low"] + (replay["l_err_pct"]/100*replay["prior_close"])
+        st.markdown("---")
 
         # ── 3-Panel Chart ──
-        fig = make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.06,
-            subplot_titles=("SPX: Predicted vs Actual High/Low","Prediction Error (%)","Equity Curve ($)"),
-            row_heights=[0.45,0.25,0.30])
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            subplot_titles=("SPX: Predicted vs Actual High/Low", "Prediction Error (%)", "Equity Curve ($)"),
+            row_heights=[0.45, 0.25, 0.30])
 
-        # Panel 1: Candlestick + predicted lines
-        fig.add_trace(go.Candlestick(x=dates,open=replay["prior_close"],high=replay["actual_high"],
-            low=replay["actual_low"],close=replay["actual_close"],name="Actual OHLC",
-            increasing_line_color="#26a69a",decreasing_line_color="#ef5350"),row=1,col=1)
+        # Panel 1: Actual high/low as range area + predicted as dotted lines
+        # Actual range shaded area
+        fig.add_trace(go.Scatter(
+            x=dates, y=replay["actual_high"], mode="lines",
+            name="Actual High", line=dict(color="#26a69a", width=1.5),
+            legendgroup="actual"
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=replay["actual_low"], mode="lines",
+            name="Actual Low", line=dict(color="#26a69a", width=1.5),
+            fill="tonexty", fillcolor="rgba(38,166,154,0.15)",
+            legendgroup="actual"
+        ), row=1, col=1)
 
-        if "pred_high" in replay.columns:
-            fig.add_trace(go.Scatter(x=dates,y=replay["pred_high"],mode="lines+markers",
-                name="Predicted High",line=dict(color="#2196F3",width=2,dash="dot"),
-                marker=dict(size=5)),row=1,col=1)
-            fig.add_trace(go.Scatter(x=dates,y=replay["pred_low"],mode="lines+markers",
-                name="Predicted Low",line=dict(color="#FF9800",width=2,dash="dot"),
-                marker=dict(size=5)),row=1,col=1)
+        # Actual close as solid line
+        fig.add_trace(go.Scatter(
+            x=dates, y=replay["actual_close"], mode="lines+markers",
+            name="Actual Close", line=dict(color="white", width=1.5),
+            marker=dict(size=4, color="white")
+        ), row=1, col=1)
+
+        # Predicted high — blue dotted
+        fig.add_trace(go.Scatter(
+            x=dates, y=replay["pred_high"], mode="lines+markers",
+            name="Predicted High",
+            line=dict(color="#2196F3", width=2.5, dash="dot"),
+            marker=dict(size=6, symbol="circle", color="#2196F3")
+        ), row=1, col=1)
+
+        # Predicted low — red/orange dotted
+        fig.add_trace(go.Scatter(
+            x=dates, y=replay["pred_low"], mode="lines+markers",
+            name="Predicted Low",
+            line=dict(color="#FF5722", width=2.5, dash="dot"),
+            marker=dict(size=6, symbol="circle", color="#FF5722")
+        ), row=1, col=1)
+
+        # Conformal bands if available
+        if "conf_90_high_hi" in replay.columns:
+            fig.add_trace(go.Scatter(
+                x=dates, y=replay["conf_90_high_hi"], mode="lines",
+                name="90% Conf Upper", line=dict(color="rgba(33,150,243,0.3)", width=1, dash="dash"),
+                showlegend=False
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=dates, y=replay["conf_90_low_lo"], mode="lines",
+                name="90% Conf Lower", line=dict(color="rgba(255,87,34,0.3)", width=1, dash="dash"),
+                fill="tonexty", fillcolor="rgba(100,100,100,0.05)",
+                showlegend=False
+            ), row=1, col=1)
 
         # Panel 2: Error bars
-        if "h_err_pct" in replay.columns:
-            colors_h = ["#ef5350" if e>0.5 else "#26a69a" for e in replay["h_err_pct"]]
-            colors_l = ["#ef5350" if e>0.5 else "#FF9800" for e in replay["l_err_pct"]]
-            fig.add_trace(go.Bar(x=dates,y=replay["h_err_pct"],name="High Error %",marker_color=colors_h,opacity=0.7),row=2,col=1)
-            fig.add_trace(go.Bar(x=dates,y=-replay["l_err_pct"],name="Low Error %",marker_color=colors_l,opacity=0.7),row=2,col=1)
-            fig.add_hline(y=0.5,line_dash="dash",line_color="red",opacity=0.5,row=2,col=1)
-            fig.add_hline(y=-0.5,line_dash="dash",line_color="red",opacity=0.5,row=2,col=1)
+        colors_h = ["#ef5350" if e > 0.5 else "#26a69a" for e in replay["h_err_pct"]]
+        colors_l = ["#ef5350" if e > 0.5 else "#FF9800" for e in replay["l_err_pct"]]
+        fig.add_trace(go.Bar(x=dates, y=replay["h_err_pct"], name="High Error %",
+            marker_color=colors_h, opacity=0.7), row=2, col=1)
+        fig.add_trace(go.Bar(x=dates, y=-replay["l_err_pct"], name="Low Error %",
+            marker_color=colors_l, opacity=0.7), row=2, col=1)
+        fig.add_hline(y=0.5, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+        fig.add_hline(y=-0.5, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
 
         # Panel 3: Equity curve
-        if "net_pnl_dollars" in replay.columns:
-            equity = replay["net_pnl_dollars"].cumsum()
-            fig.add_trace(go.Scatter(x=dates,y=equity,mode="lines",name="Cumulative P&L",
-                line=dict(color="#2196F3",width=2),fill="tozeroy",fillcolor="rgba(33,150,243,0.1)"),row=3,col=1)
-            loss_mask = replay["condor"]=="LOSS"
-            if loss_mask.any():
-                fig.add_trace(go.Scatter(x=dates[loss_mask],y=equity[loss_mask],mode="markers",
-                    name="Loss Days",marker=dict(color="red",size=10,symbol="x")),row=3,col=1)
+        equity_vals = replay["net_pnl_dollars"].cumsum()
+        fig.add_trace(go.Scatter(x=dates, y=equity_vals, mode="lines",
+            name="Cumulative P&L", line=dict(color="#2196F3", width=2.5),
+            fill="tozeroy", fillcolor="rgba(33,150,243,0.1)"), row=3, col=1)
 
-        fig.update_layout(height=900,showlegend=True,
-            legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1),
-            margin=dict(l=50,r=20,t=60,b=30),xaxis_rangeslider_visible=False)
-        fig.update_yaxes(title_text="Price",row=1,col=1)
-        fig.update_yaxes(title_text="Error %",row=2,col=1)
-        fig.update_yaxes(title_text="Cumulative $",row=3,col=1)
-        st.plotly_chart(fig,use_container_width=True)
+        loss_mask = replay["condor"] == "LOSS"
+        if loss_mask.any():
+            fig.add_trace(go.Scatter(x=dates[loss_mask], y=equity_vals[loss_mask],
+                mode="markers", name="Loss Days",
+                marker=dict(color="red", size=10, symbol="x")), row=3, col=1)
+
+        win_mask = replay["condor"] == "WIN"
+        if win_mask.any():
+            fig.add_trace(go.Scatter(x=dates[win_mask], y=equity_vals[win_mask],
+                mode="markers", name="Win Days",
+                marker=dict(color="#26a69a", size=6, symbol="circle")), row=3, col=1)
+
+        fig.update_layout(
+            height=950, showlegend=True,
+            template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=60, r=20, t=60, b=30),
+            xaxis_rangeslider_visible=False
+        )
+        fig.update_yaxes(title_text="SPX Price", row=1, col=1)
+        fig.update_yaxes(title_text="Error %", row=2, col=1)
+        fig.update_yaxes(title_text="Cumulative $", row=3, col=1)
+        st.plotly_chart(fig, use_container_width=True)
 
         # ── Day-by-Day Table ──
-        st.markdown("---"); st.subheader("Day-by-Day Comparison")
+        st.markdown("---")
+        st.subheader("Day-by-Day Comparison")
         table_cols = ["date"]
-        display_names = {"date":"Date"}
-        for col,name in [("prior_close","Prior Close"),("pred_high","Pred High"),
-            ("actual_high","Actual High"),("h_err_pct","High Err %"),
-            ("pred_low","Pred Low"),("actual_low","Actual Low"),("l_err_pct","Low Err %"),
-            ("actual_close","Actual Close"),("dir_correct","Dir OK"),("regime","Regime"),
-            ("condor","Condor"),("net_pnl_dollars","P&L ($)")]:
-            if col in replay.columns: table_cols.append(col); display_names[col]=name
+        display_names = {"date": "Date"}
+        for col, name in [("prior_close","Prior Close"), ("pred_high","Pred High"),
+            ("actual_high","Actual High"), ("h_err_pct","High Err %"),
+            ("pred_low","Pred Low"), ("actual_low","Actual Low"), ("l_err_pct","Low Err %"),
+            ("actual_close","Actual Close"), ("dir_correct","Dir OK"), ("regime","Regime"),
+            ("condor","Condor"), ("net_pnl_dollars","P&L ($)")]:
+            if col in replay.columns:
+                table_cols.append(col)
+                display_names[col] = name
+
         display_df = replay[table_cols].copy().rename(columns=display_names)
         for c in ["Prior Close","Pred High","Actual High","Pred Low","Actual Low","Actual Close"]:
-            if c in display_df.columns: display_df[c]=display_df[c].map(lambda x:f"{x:,.2f}" if pd.notna(x) else "")
-        if "High Err %" in display_df.columns: display_df["High Err %"]=display_df["High Err %"].map(lambda x:f"{x:.3f}%")
-        if "Low Err %" in display_df.columns: display_df["Low Err %"]=display_df["Low Err %"].map(lambda x:f"{x:.3f}%")
-        if "P&L ($)" in display_df.columns: display_df["P&L ($)"]=display_df["P&L ($)"].map(lambda x:f"${x:+,.0f}")
-        if "Dir OK" in display_df.columns: display_df["Dir OK"]=display_df["Dir OK"].map(lambda x:"✓" if x else "✗")
-        if "Date" in display_df.columns: display_df["Date"]=pd.to_datetime(display_df["Date"]).dt.strftime("%Y-%m-%d")
-        st.dataframe(display_df,use_container_width=True,height=600)
+            if c in display_df.columns:
+                display_df[c] = display_df[c].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+        if "High Err %" in display_df.columns:
+            display_df["High Err %"] = display_df["High Err %"].map(lambda x: f"{x:.3f}%")
+        if "Low Err %" in display_df.columns:
+            display_df["Low Err %"] = display_df["Low Err %"].map(lambda x: f"{x:.3f}%")
+        if "P&L ($)" in display_df.columns:
+            display_df["P&L ($)"] = display_df["P&L ($)"].map(lambda x: f"${x:+,.0f}")
+        if "Dir OK" in display_df.columns:
+            display_df["Dir OK"] = display_df["Dir OK"].map(lambda x: "✓" if x else "✗")
+        if "Date" in display_df.columns:
+            display_df["Date"] = pd.to_datetime(display_df["Date"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(display_df, use_container_width=True, height=600)
 
         # ── Coverage Heatmap ──
-        cov_cols = ["cov68h","cov68l","cov90h","cov90l"]
+        cov_cols = ["cov68h", "cov68l", "cov90h", "cov90l"]
         if all(c in replay.columns for c in cov_cols):
-            st.markdown("---"); st.subheader("Conformal Coverage Heatmap")
-            cov_data = replay[["date"]+cov_cols].copy()
-            cov_data["date"] = cov_data["date"].dt.strftime("%Y-%m-%d")
+            st.markdown("---")
+            st.subheader("Conformal Coverage Heatmap")
+            cov_data = replay[["date"] + cov_cols].copy()
             cov_matrix = cov_data[cov_cols].astype(int).T
-            cov_matrix.columns = cov_data["date"]
-            cov_matrix.index = ["68% High","68% Low","90% High","90% Low"]
-            fig_hm = go.Figure(data=go.Heatmap(z=cov_matrix.values,x=cov_matrix.columns,y=cov_matrix.index,
-                colorscale=[[0,"#ef5350"],[1,"#26a69a"]],showscale=False))
-            fig_hm.update_layout(height=200,margin=dict(l=100,r=20,t=30,b=30))
-            st.plotly_chart(fig_hm,use_container_width=True)
+            cov_matrix.columns = cov_data["date"].dt.strftime("%Y-%m-%d")
+            cov_matrix.index = ["68% High", "68% Low", "90% High", "90% Low"]
 
-        # ── Statistics ──
-        st.markdown("---"); st.subheader("Performance Statistics")
-        sc1,sc2,sc3,sc4 = st.columns(4)
-        with sc1:
-            st.markdown("**Prediction Accuracy**")
-            if "h_err_pct" in replay.columns:
-                st.write(f"Mean High Error: {replay['h_err_pct'].mean():.4f}%")
-                st.write(f"Mean Low Error: {replay['l_err_pct'].mean():.4f}%")
-        with sc2:
-            st.markdown("**Direction**")
-            if "dir_correct" in replay.columns:
-                da = replay["dir_correct"].mean()*100
-                st.write(f"Accuracy: {replay['dir_correct'].sum()}/{len(replay)} ({da:.1f}%)")
-        with sc3:
-            st.markdown("**Iron Condor**")
-            wins = len(replay[replay["condor"]=="WIN"])
-            st.write(f"Win Rate: {wins}/{len(replay)} ({wins/len(replay)*100:.1f}%)")
-            if "net_pnl_dollars" in replay.columns:
-                st.write(f"Total P&L: ${replay['net_pnl_dollars'].sum():,.2f}")
-                equity = replay["net_pnl_dollars"].cumsum()
-                st.write(f"Max DD: ${(equity-equity.cummax()).min():,.2f}")
-        with sc4:
-            st.markdown("**Coverage**")
-            for col,label in [("cov68h","68% High"),("cov68l","68% Low"),("cov90h","90% High"),("cov90l","90% Low")]:
-                if col in replay.columns: st.write(f"{label}: {replay[col].mean()*100:.1f}%")
+            fig_cov = go.Figure(data=go.Heatmap(
+                z=cov_matrix.values, x=cov_matrix.columns.tolist(),
+                y=cov_matrix.index.tolist(),
+                colorscale=[[0, "#ef5350"], [1, "#26a69a"]],
+                showscale=False, text=cov_matrix.values,
+                texttemplate="%{text}", textfont=dict(size=10)
+            ))
+            fig_cov.update_layout(height=200, margin=dict(l=100, r=20, t=20, b=40),
+                template="plotly_dark", xaxis=dict(tickangle=45))
+            st.plotly_chart(fig_cov, use_container_width=True)
+
+            # Coverage summary
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("68% High Coverage", f"{replay['cov68h'].mean()*100:.1f}%")
+            c2.metric("68% Low Coverage", f"{replay['cov68l'].mean()*100:.1f}%")
+            c3.metric("90% High Coverage", f"{replay['cov90h'].mean()*100:.1f}%")
+            c4.metric("90% Low Coverage", f"{replay['cov90l'].mean()*100:.1f}%")
     else:
-        st.warning("No replay data found.")
+        st.warning("No replay data found. Run the replay script first.")
 
-# ══════════════════════════════════════════════════════════════════════
-#  SPX: REPLAY DETAIL (day-by-day drill-down)
-# ══════════════════════════════════════════════════════════════════════
+
 elif page == "🎯 Replay Detail":
     st.title("Replay Detail — Jan-Feb 2026")
     replay = spx_load_replay(); spx = spx_load_data()
