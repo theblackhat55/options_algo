@@ -66,7 +66,7 @@ def get_market_context(
         spy_ret_5d = round((close.iloc[-1] / close.iloc[-5] - 1) * 100, 2)
         spy_ret_20d = round((close.iloc[-1] / close.iloc[-21] - 1) * 100, 2)
 
-        import pandas_ta as ta
+        import pandas_ta_classic as ta
         ema20 = ta.ema(close, length=20).iloc[-1]
         ema50 = ta.ema(close, length=50).iloc[-1]
         price = close.iloc[-1]
@@ -117,7 +117,7 @@ def get_market_context(
     above_ema50 = 0
     total_counted = 0
     try:
-        import pandas_ta as ta
+        import pandas_ta_classic as ta
         for ticker, df in data.items():
             if df is None or len(df) < 55:
                 continue

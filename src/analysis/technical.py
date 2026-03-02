@@ -25,7 +25,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 
 from config.settings import (
     EMA_FAST, EMA_MEDIUM, EMA_SLOW,
