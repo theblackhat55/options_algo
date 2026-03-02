@@ -1,52 +1,50 @@
 """
 src/data/polygon_client.py
 ==========================
-Rate-limited Polygon.io REST client wrapper.
-Free tier: 5 calls/min → 1 call every 13 seconds to stay safe.
-Starter tier: unlimited → no delay needed.
+Rate-limited Polygon.io client using requests (not SDK pagination).
+Free tier: 5 calls/min → 1 call every 13 seconds.
 """
 import os
 import time
 import logging
-from functools import wraps
-from polygon import RESTClient
+from pathlib import Path
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
-# Rate limit config
-FREE_TIER_DELAY = 13  # seconds between calls (5/min = 12s, add 1s buffer)
-STARTER_TIER_DELAY = 0.1  # minimal delay for paid tier
-
+BASE_URL = "https://api.polygon.io"
+_api_key = None
 _last_call_time = 0.0
-_client = None
-_delay = FREE_TIER_DELAY  # default to free tier
+_delay = 13  # free tier default
 
 
-def get_client() -> RESTClient:
-    """Get or create the singleton Polygon REST client."""
-    global _client
-    if _client is None:
-        api_key = os.getenv("POLYGON_API_KEY", "")
-        if not api_key:
-            raise ValueError("POLYGON_API_KEY not set in environment or .env")
-        _client = RESTClient(api_key)
-        logger.info("Polygon client initialized")
-    return _client
+def _get_key():
+    global _api_key
+    if _api_key is None:
+        _api_key = os.getenv("POLYGON_API_KEY", "")
+        if not _api_key:
+            raise ValueError("POLYGON_API_KEY not set")
+    return _api_key
 
 
 def set_tier(tier: str = "free"):
-    """Set rate limit tier: 'free' (5/min) or 'starter' (unlimited)."""
     global _delay
-    if tier.lower() == "starter":
-        _delay = STARTER_TIER_DELAY
-        logger.info("Polygon rate limit: STARTER (unlimited)")
+    if tier.lower() in ("starter", "paid", "premium"):
+        _delay = 0.2
+        logger.info("Polygon rate limit: PAID (unlimited)")
     else:
-        _delay = FREE_TIER_DELAY
-        logger.info(f"Polygon rate limit: FREE ({FREE_TIER_DELAY}s between calls)")
+        _delay = 13
+        logger.info(f"Polygon rate limit: FREE (13s between calls)")
 
 
-def throttle():
-    """Wait if needed to respect rate limits."""
+def _throttle():
     global _last_call_time
     now = time.time()
     elapsed = now - _last_call_time
@@ -57,38 +55,67 @@ def throttle():
     _last_call_time = time.time()
 
 
-def rate_limited(func):
-    """Decorator to add rate limiting to any Polygon API call."""
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        throttle()
-        return func(*args, **kwargs)
-    return wrapper
+def _request(endpoint: str, params: dict = None) -> dict:
+    """Make a single throttled GET request to Polygon."""
+    _throttle()
+    key = _get_key()
+    if params is None:
+        params = {}
+    params["apiKey"] = key
+    url = f"{BASE_URL}{endpoint}"
+    resp = requests.get(url, params=params, timeout=30)
+    if resp.status_code == 429:
+        logger.warning("Rate limited — waiting 60s and retrying")
+        time.sleep(60)
+        _throttle()
+        resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
-@rate_limited
-def list_options_contracts(underlying: str, **kwargs):
-    """Rate-limited wrapper for listing options contracts."""
-    client = get_client()
-    return list(client.list_options_contracts(underlying, **kwargs))
+def list_options_contracts(underlying: str, limit: int = 50, **kwargs) -> list:
+    """List options contracts — single page only (no auto-pagination)."""
+    params = {"underlying_ticker": underlying, "limit": limit}
+    params.update(kwargs)
+    data = _request("/v3/reference/options/contracts", params)
+    return data.get("results", [])
 
 
-@rate_limited
-def get_snapshot_option(underlying: str, option_contract: str):
-    """Rate-limited wrapper for option snapshot."""
-    client = get_client()
-    return client.get_snapshot_option(underlying, option_contract)
+def get_options_chain(underlying: str, expiration_date: str = None,
+                      strike_price_gte: float = None, strike_price_lte: float = None,
+                      contract_type: str = None, limit: int = 250) -> list:
+    """Get options chain snapshot for a ticker."""
+    params = {"limit": limit}
+    if expiration_date:
+        params["expiration_date"] = expiration_date
+    if strike_price_gte:
+        params["strike_price.gte"] = strike_price_gte
+    if strike_price_lte:
+        params["strike_price.lte"] = strike_price_lte
+    if contract_type:
+        params["contract_type"] = contract_type
+    data = _request(f"/v3/snapshot/options/{underlying}", params)
+    return data.get("results", [])
 
 
-@rate_limited
-def list_snapshot_options_chain(underlying: str, **kwargs):
-    """Rate-limited wrapper for full options chain snapshot."""
-    client = get_client()
-    return list(client.list_snapshot_options_chain(underlying, **kwargs))
+def get_stock_snapshot(ticker: str) -> dict:
+    """Get current stock snapshot (price, volume, etc)."""
+    data = _request(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}")
+    return data.get("ticker", {})
 
 
-@rate_limited
-def get_aggs(ticker: str, multiplier: int, timespan: str, from_: str, to: str, **kwargs):
-    """Rate-limited wrapper for aggregates (OHLCV bars)."""
-    client = get_client()
-    return list(client.get_aggs(ticker, multiplier, timespan, from_, to, **kwargs))
+def get_aggs(ticker: str, multiplier: int, timespan: str,
+             from_date: str, to_date: str, limit: int = 5000) -> list:
+    """Get OHLCV aggregates."""
+    params = {"adjusted": "true", "sort": "asc", "limit": limit}
+    data = _request(
+        f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}",
+        params
+    )
+    return data.get("results", [])
+
+
+def get_last_quote(ticker: str) -> dict:
+    """Get last quote for a ticker."""
+    data = _request(f"/v2/last/nbbo/{ticker}")
+    return data.get("results", {})
