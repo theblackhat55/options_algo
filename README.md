@@ -1,114 +1,171 @@
 # Options Algo
 
-Automated options strategy scanner and trade generator for S&P 100 stocks.
+Systematic options trading system for the S&P 100 universe.
 Runs nightly after market close, delivers top picks via WhatsApp through OpenClaw.
 
-## Strategy Coverage
+## Strategies
 
-| Strategy | Regime | IV | Type |
-|---|---|---|---|
-| Bull Call Spread | Uptrend | Low / Normal | Debit |
-| Bear Put Spread | Downtrend | Low / Normal | Debit |
-| Bull Put Spread | Uptrend | High | Credit |
-| Bear Call Spread | Downtrend | High | Credit |
-| Iron Condor | Range-bound | High / Normal | Credit |
-| Long Butterfly | Range-bound / Squeeze | Low | Debit |
+| Strategy | When | IV Regime |
+|---|---|---|
+| Bull Put Spread | Uptrend | HIGH |
+| Bull Call Spread | Uptrend | LOW / NORMAL |
+| Bear Call Spread | Downtrend | HIGH |
+| Bear Put Spread | Downtrend | LOW / NORMAL |
+| Iron Condor | Range-bound | HIGH / NORMAL |
+| Long Butterfly | Range-bound / Squeeze | LOW |
+
+---
 
 ## Architecture
 
 ```
 options_algo/
-├── config/
-│   ├── settings.py          # API keys, thresholds, paths
-│   ├── universe.py          # S&P 100 tickers + sector map
-│   └── strategies.py        # Strategy parameters
+├── config/              # Settings, universe, strategy params
 ├── src/
-│   ├── data/
-│   │   ├── stock_fetcher.py       # OHLCV download + cache (yfinance)
-│   │   ├── options_fetcher.py     # Options chains (Polygon → Tradier → yfinance)
-│   │   ├── earnings_calendar.py   # Earnings dates (Finnhub)
-│   │   └── market_context.py      # VIX proxy, breadth, sector ETFs
-│   ├── analysis/
-│   │   ├── technical.py           # Regime classifier (8 regimes)
-│   │   ├── volatility.py          # IV rank, IV percentile, IV/HV ratio
-│   │   ├── options_analytics.py   # Black-Scholes Greeks, prob calcs
-│   │   └── relative_strength.py   # Mansfield RS vs SPY + sector
-│   ├── strategy/
-│   │   ├── selector.py            # Regime × IV → strategy matrix
-│   │   ├── credit_spread.py       # Bull put + bear call spreads
-│   │   ├── bull_call_spread.py
-│   │   ├── bear_put_spread.py
-│   │   ├── iron_condor.py
-│   │   └── butterfly.py
-│   ├── risk/
-│   │   ├── event_filter.py        # Earnings / event exclusion
-│   │   ├── position_sizer.py      # Kelly criterion sizing
-│   │   └── portfolio.py           # Portfolio Greeks + position limits
-│   ├── screener/
-│   │   └── composite_screener.py  # Unified screener interface
-│   ├── models/
-│   │   ├── features.py            # ML feature engineering
-│   │   ├── trainer.py             # Walk-forward LightGBM training
-│   │   └── predictor.py           # Model loading + inference
-│   └── pipeline/
-│       ├── nightly_scan.py        # Main orchestrator
-│       ├── morning_brief.py       # WhatsApp formatter
-│       ├── position_monitor.py    # Intraday exit alerts
-│       └── outcome_tracker.py     # Paper trade log + ML dataset
-├── dashboard/
-│   └── app.py               # Streamlit dashboard (6 pages)
-├── scripts/
-│   ├── setup_data.py        # Initial 2yr data backfill
-│   ├── daily_scan.sh        # Cron shell wrapper
-│   ├── morning_report.sh    # Morning brief shell wrapper
-│   └── retrain_models.py    # Weekly ML retrain
-└── tests/
-    ├── test_volatility.py
-    ├── test_strategies.py
-    ├── test_screener.py
-    └── test_pipeline.py
+│   ├── data/            # OHLCV + options chain fetchers
+│   ├── analysis/        # Technical regimes, IV, Greeks, RS
+│   ├── strategy/        # Six spread constructors + selector
+│   ├── screener/        # Composite screener
+│   ├── risk/            # Position sizing, portfolio, event filter
+│   ├── models/          # LightGBM ML layer (activates after 200 trades)
+│   └── pipeline/        # Nightly scan, morning brief, monitor, tracker
+├── dashboard/           # Streamlit dashboard
+├── scripts/             # Setup, retrain, cron shell scripts
+└── tests/               # pytest test suite
 ```
 
-## Budget
+---
 
-| Item | Cost/Month |
-|---|---|
-| Polygon Options Starter | $29 |
-| Polygon Stocks Starter | $29 |
-| Tradier (free w/ account) | $0 |
-| Finnhub (existing) | $0 |
-| Hetzner server (shared) | $0 |
-| **Total** | **$58** |
+## Quick Start
 
-## Server Setup (Hetzner)
+### 1. Clone and install
 
 ```bash
 cd /root
 git clone https://github.com/theblackhat55/options_algo.git
 cd options_algo
-
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# Copy and fill in API keys
+### 2. Configure API keys
+
+```bash
 cp .env.example .env
-nano .env
+nano .env   # add POLYGON_API_KEY at minimum
+```
 
-# Backfill 2 years of price data
-python scripts/setup_data.py
+### 3. Download historical data
 
-# Test the pipeline (no live options data)
+```bash
+python scripts/setup_data.py --small   # 10 tickers, test run
+python scripts/setup_data.py           # Full SP100 universe
+```
+
+### 4. Run nightly scan
+
+```bash
+# Dry run (no live options data, fast)
 python -m src.pipeline.nightly_scan --dry-run
 
-# Launch dashboard
+# Full run (requires Polygon API key)
+python -m src.pipeline.nightly_scan
+```
+
+### 5. View morning brief
+
+```bash
+python -m src.pipeline.morning_brief
+```
+
+### 6. Launch dashboard
+
+```bash
 streamlit run dashboard/app.py --server.port 8501
 ```
 
+---
+
+## Pipeline Flow
+
+```
+After market close (9:30 PM ET)
+        │
+        ▼
+1. Update OHLCV data (yfinance, incremental)
+        │
+        ▼
+2. Pre-filter: price ≥ $20, avg vol ≥ 1M
+        │
+        ▼
+3. Market context: VIX proxy, SPY trend, breadth
+        │
+        ▼
+4. Classify regimes (ADX, RSI, EMAs, Bollinger)
+        │
+        ▼
+5. Relative strength vs SPY + sector ETF
+        │
+        ▼
+6. IV analysis: IV rank, IV percentile, IV/HV ratio
+        │
+        ▼
+7. Strategy selection (regime × IV matrix)
+        │
+        ▼
+8. Event filter: skip stocks with earnings in DTE window
+        │
+        ▼
+9. Construct trades: optimal strikes via delta/price
+        │
+        ▼
+10. Rank: confidence × PoP × (1/RR) × EV bonus
+        │
+        ▼
+11. Save signal JSON → WhatsApp morning brief
+```
+
+---
+
+## Configuration
+
+All parameters are in `config/settings.py` and overridable via `.env`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `MAX_RISK_PER_TRADE_PCT` | 2.0 | Max % of account risked per trade |
+| `MAX_POSITIONS` | 5 | Maximum concurrent open positions |
+| `PROFIT_TARGET_PCT` | 50 | Close credit spreads at 50% of max profit |
+| `STOP_LOSS_PCT` | 100 | Close at 100% of credit received (2× debit) |
+| `IV_HIGH_THRESHOLD` | 70 | IV rank above = sell premium |
+| `IV_LOW_THRESHOLD` | 30 | IV rank below = buy premium |
+| `DEFAULT_DTE_PREMIUM_SELL` | 45 | DTE for credit spreads |
+| `DEFAULT_DTE_DIRECTIONAL` | 21 | DTE for debit spreads |
+| `DEFAULT_SHORT_DELTA` | 0.25 | Short strike delta target |
+| `IC_WING_DELTA` | 0.16 | Iron condor wing delta |
+
+---
+
+## Data Sources
+
+| Source | Plan | Purpose |
+|---|---|---|
+| Polygon.io Options | Starter ($29/mo) | Options chains, IV, Greeks |
+| Polygon.io Stocks | Starter ($29/mo) | Real-time OHLCV |
+| yfinance | Free | OHLCV fallback, options fallback |
+| Finnhub | Free | Earnings calendar |
+| Tradier | Free (brokerage) | Backup options data |
+| Alpha Vantage | Free | Backup quotes |
+
+---
+
 ## OpenClaw Cron Jobs
 
+Add from the OpenClaw user on the Hetzner server:
+
 ```bash
-# Nightly scan — 9:30 PM ET (02:30 UTC) Tue–Sat
+# Nightly scan — 9:30 PM ET (02:30 UTC) Tue-Sat
 openclaw cron add \
   --name "Options nightly scan" \
   --cron "30 2 * * 2-6" \
@@ -118,7 +175,7 @@ openclaw cron add \
   --announce --channel whatsapp --to "your_whatsapp_number_here" \
   --timeout-seconds 600
 
-# Morning brief — 9:00 AM ET (14:00 UTC) Mon–Fri
+# Morning brief — 9:00 AM ET (14:00 UTC) Mon-Fri
 openclaw cron add \
   --name "Options morning brief" \
   --cron "0 14 * * 1-5" \
@@ -129,107 +186,85 @@ openclaw cron add \
   --timeout-seconds 120
 ```
 
-## Pipeline Flow
+---
 
-```
-After close (9:30 PM ET)
-        │
-        ▼
-1. Update OHLCV (yfinance incremental)
-        │
-        ▼
-2. Pre-filter: price ≥ $20, avg vol ≥ 1M
-        │
-        ▼
-3. Market context: VIX proxy, breadth, sector ETFs
-        │
-        ▼
-4. Classify regimes (8 regimes per stock)
-        │
-        ▼
-5. Relative strength vs SPY + sector
-        │
-        ▼
-6. IV analysis: rank, percentile, IV/HV ratio
-        │
-        ▼
-7. Strategy selection (regime × IV matrix)
-        │
-        ▼
-8. Event filter: skip stocks with earnings in window
-        │
-        ▼
-9. Construct trades: fetch live chain → find optimal strikes
-        │
-        ▼
-10. Rank by composite score → top 5 picks
-        │
-        ▼
-11. Save JSON signal → format WhatsApp message
-```
+## ML Layer (Phase 3 — activates after 200 trades)
 
-## Regime → Strategy Matrix
-
-```
-                    IV HIGH (≥70)     IV NORMAL       IV LOW (≤30)
-STRONG UPTREND      Bull Put Spread   Bull Call Spread Bull Call Spread
-UPTREND             Bull Put Spread   Bull Call Spread Bull Call Spread
-RANGE BOUND         Iron Condor       Iron Condor      Long Butterfly
-DOWNTREND           Bear Call Spread  Bear Put Spread  Bear Put Spread
-STRONG DOWNTREND    Bear Call Spread  Bear Put Spread  Bear Put Spread
-SQUEEZE             Iron Condor       Long Butterfly   Long Butterfly
-REVERSAL UP         Bull Put Spread   Bull Call Spread Bull Call Spread
-REVERSAL DOWN       Bear Call Spread  Bear Put Spread  Bear Put Spread
-```
-
-## ML Layer (activates after 200+ outcomes)
-
-Features used per trade:
-- IV rank, IV percentile, IV/HV ratio, IV trend
-- ADX, RSI, trend strength, direction score, EMA alignment
-- Relative strength rank (vs SPY), RS trend
-- DTE at entry, spread width, short delta
-- Sector (encoded), BB squeeze flag
-
-Model: LightGBM binary classifier (win/loss)
-Validation: Walk-forward, minimum 1yr training window
-Replaces rules-based confidence score when ready.
-
-## Exit Rules
-
-| Strategy | Profit Target | Stop Loss |
-|---|---|---|
-| Credit spreads | 50% of max credit | 100% of credit (spread at 2× credit) |
-| Debit spreads | 50% of max profit | 50% of debit paid |
-| Iron Condor | 50% of total credit | 200% of credit |
-| Butterfly | 40% of max profit | 50% of debit |
-
-## Development
+Once 200+ paper trade outcomes are recorded in `output/trades/trade_outcomes.jsonl`,
+train LightGBM models per strategy:
 
 ```bash
-# Run tests
-pytest tests/ -v --tb=short
-
-# Run tests with coverage
-pytest tests/ --cov=src --cov=config --cov-report=term-missing
-
-# Dry-run scan (no network calls for options)
-python -m src.pipeline.nightly_scan --dry-run
-
-# Format morning brief from last signal
-python -m src.pipeline.morning_brief
-
-# Retrain ML models
 python scripts/retrain_models.py
 ```
 
-## Phases
+Features: IV rank, IV/HV ratio, ADX, RSI, trend strength, direction score,
+RS rank, sector, DTE, spread width, short delta, confidence.
 
-- **Phase 1 (Week 1):** Data pipeline, regime classifier, IV analysis, credit spreads, nightly scan ✅
-- **Phase 2 (Week 2):** All strategy constructors, Iron Condor, Butterfly ✅
-- **Phase 3 (Week 3):** Streamlit dashboard, position monitor, outcome tracker ✅
-- **Phase 4 (Month 2+):** ML layer activates after 200+ paper trade outcomes
+Target: binary win/loss. Walk-forward validation with quarter-Kelly sizing.
 
-## License
+---
 
-Private — theblackhat55
+## Testing
+
+```bash
+# Full test suite
+pytest tests/ -v
+
+# With coverage
+pytest tests/ -v --cov=src --cov=config --cov-report=term-missing
+
+# Single module
+pytest tests/test_strategies.py -v
+pytest tests/test_volatility.py -v
+pytest tests/test_screener.py -v
+pytest tests/test_pipeline.py -v
+```
+
+---
+
+## Budget
+
+| Item | Cost/Month |
+|---|---|
+| Polygon.io Options Starter | $29 |
+| Polygon.io Stocks Starter | $29 |
+| Hetzner server (shared with spx_algo) | $0 |
+| All other data sources | $0 |
+| **Total** | **$58** |
+
+Reserve: $42/month for future upgrades.
+
+---
+
+## Roadmap
+
+- [x] Phase 1 — Data pipeline, regime classifier, IV analysis
+- [x] Phase 1 — Six strategy constructors (all spread types)
+- [x] Phase 1 — Nightly scan pipeline + WhatsApp morning brief
+- [x] Phase 1 — Event filter, position sizing, portfolio tracker
+- [x] Phase 1 — Outcome tracker (paper trade log)
+- [x] Phase 1 — Streamlit dashboard
+- [ ] Phase 2 — Live Polygon options chains in production
+- [ ] Phase 2 — Position monitor intraday alerts via OpenClaw
+- [ ] Phase 3 — ML layer after 200+ outcomes (LightGBM per strategy)
+- [ ] Phase 4 — Strike optimizer (ML-driven strike selection)
+- [ ] Phase 4 — Sector rotation overlay
+
+---
+
+## Server Setup (Hetzner — shared with spx_algo)
+
+```bash
+# Same server, separate virtualenv
+cd /root
+git clone https://github.com/theblackhat55/options_algo.git
+cd options_algo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env && nano .env
+python scripts/setup_data.py
+```
+
+Shared resources: 8GB RAM, sufficient for both spx_algo and options_algo
+running sequentially (scans staggered by 30 min).
