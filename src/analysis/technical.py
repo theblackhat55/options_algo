@@ -9,6 +9,19 @@ Regimes drive strategy selection:
   DOWNTREND / STRONG_DOWNTREND  → Bear put spread or Bear call spread (credit)
   SQUEEZE                       → Long butterfly (breakout anticipated)
   REVERSAL_UP / REVERSAL_DOWN   → Directional spreads on oversold/overbought
+  OVERSOLD_BOUNCE               → NEW: down >2 ATR in 5d + bouncing → no directional short
+  OVERBOUGHT_DROP               → NEW: up >2 ATR in 5d + fading → no directional long
+
+V2 changes:
+  - Added short-term momentum (3d ROC) to direction_score
+  - Added OVERSOLD_BOUNCE and OVERBOUGHT_DROP regimes to prevent fighting snap-backs
+  - Mean-reversion guard: if stock dropped >2 ATR in 5 days and RSI<35 and
+    3d ROC positive, classify as OVERSOLD_BOUNCE instead of DOWNTREND/STRONG_DOWNTREND
+  - If stock rallied >2 ATR in 5 days and RSI>65 and 3d ROC negative,
+    classify as OVERBOUGHT_DROP instead of UPTREND/STRONG_UPTREND
+  - Snap-back guard inside trending regimes: even if ADX is trending, a
+    positive 3d ROC >1% inside a bearish setup (or vice versa) gets
+    reclassified to a snap-back regime so selector skips the directional trade
 
 Usage:
     from src.analysis.technical import classify_regime, classify_universe
@@ -19,19 +32,20 @@ Usage:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 
 from config.settings import (
     EMA_FAST, EMA_MEDIUM, EMA_SLOW,
     ADX_PERIOD, ADX_TRENDING_THRESHOLD,
     RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT,
     BB_PERIOD, BB_STD, ATR_PERIOD,
+    SNAPBACK_ATR_THRESHOLD, SNAPBACK_ROC_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,14 +54,16 @@ logger = logging.getLogger(__name__)
 # ─── Regime Enum ──────────────────────────────────────────────────────────────
 
 class Regime(str, Enum):
-    STRONG_UPTREND  = "STRONG_UPTREND"
-    UPTREND         = "UPTREND"
-    RANGE_BOUND     = "RANGE_BOUND"
-    DOWNTREND       = "DOWNTREND"
+    STRONG_UPTREND   = "STRONG_UPTREND"
+    UPTREND          = "UPTREND"
+    RANGE_BOUND      = "RANGE_BOUND"
+    DOWNTREND        = "DOWNTREND"
     STRONG_DOWNTREND = "STRONG_DOWNTREND"
-    SQUEEZE         = "SQUEEZE"           # BB squeeze → breakout imminent
-    REVERSAL_UP     = "REVERSAL_UP"       # Oversold bounce candidate
-    REVERSAL_DOWN   = "REVERSAL_DOWN"     # Overbought reversal candidate
+    SQUEEZE          = "SQUEEZE"           # BB squeeze → breakout imminent
+    REVERSAL_UP      = "REVERSAL_UP"       # Oversold bounce candidate
+    REVERSAL_DOWN    = "REVERSAL_DOWN"     # Overbought reversal candidate
+    OVERSOLD_BOUNCE  = "OVERSOLD_BOUNCE"   # NEW: dropped >2 ATR but bouncing — don't short
+    OVERBOUGHT_DROP  = "OVERBOUGHT_DROP"   # NEW: rallied >2 ATR but fading — don't buy
 
 
 # ─── StockRegime Dataclass ────────────────────────────────────────────────────
@@ -69,6 +85,8 @@ class StockRegime:
     atr_pct: float             # ATR as % of price
     price: float               # Latest close price
     volume_trend: str          # "rising" | "falling" | "neutral" (10d vs 30d avg)
+    roc_3d: float = 0.0        # NEW: 3-day rate of change (%)
+    atr_move_5d: float = 0.0   # NEW: 5-day price move expressed in ATR units
 
 
 # ─── Main Classification Function ────────────────────────────────────────────
@@ -104,9 +122,9 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
             return None
 
         # ── ADX ───────────────────────────────────────────────────────────────
-        adx_df  = ta.adx(high, low, close, length=ADX_PERIOD)
-        adx_val = float(adx_df.iloc[-1][f"ADX_{ADX_PERIOD}"])
-        plus_di = float(adx_df.iloc[-1][f"DMP_{ADX_PERIOD}"])
+        adx_df   = ta.adx(high, low, close, length=ADX_PERIOD)
+        adx_val  = float(adx_df.iloc[-1][f"ADX_{ADX_PERIOD}"])
+        plus_di  = float(adx_df.iloc[-1][f"DMP_{ADX_PERIOD}"])
         minus_di = float(adx_df.iloc[-1][f"DMN_{ADX_PERIOD}"])
 
         # ── RSI ───────────────────────────────────────────────────────────────
@@ -123,10 +141,6 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
 
         if bb_upper_col is None or bb_lower_col is None or bb_mid_col is None:
             raise ValueError(f"Unexpected BB column names: {bb.columns.tolist()}")
-
-        bb_upper = float(bb.iloc[-1][bb_upper_col])
-        bb_lower = float(bb.iloc[-1][bb_lower_col])
-        bb_mid   = float(bb.iloc[-1][bb_mid_col])
 
         bb_squeeze = False
         if bb_bw_col and bb_bw_col in bb.columns:
@@ -176,6 +190,17 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
 
         direction_score = round(max(-1.0, min(1.0, direction_score)), 3)
 
+        # ── NEW: Short-term momentum indicators ───────────────────────────────
+        # 3-day rate of change (%) — detects snap-backs and fades
+        roc_3d = round((price / float(close.iloc[-3]) - 1) * 100, 2) if len(close) >= 3 else 0.0
+
+        # 5-day move expressed in ATR units — detects extreme short-term moves
+        if len(close) >= 5 and atr > 0:
+            move_5d = price - float(close.iloc[-5])
+            atr_move_5d = round(move_5d / atr, 2)
+        else:
+            atr_move_5d = 0.0
+
         # ── Trend Strength ────────────────────────────────────────────────────
         trend_strength = round(min(adx_val / 50, 1.0), 3)
 
@@ -190,14 +215,45 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
             volume_trend = "neutral"
 
         # ── Regime Classification ─────────────────────────────────────────────
-        if bb_squeeze:
+        #
+        # Priority order (highest to lowest):
+        #   P1. Mean-reversion detection (OVERSOLD_BOUNCE / OVERBOUGHT_DROP)
+        #       — stock moved >SNAPBACK_ATR_THRESHOLD ATRs in 5d with
+        #         confirming RSI extreme AND short-term momentum reversal
+        #   P2. Bollinger Squeeze
+        #   P3. Classic RSI extremes (REVERSAL_UP / REVERSAL_DOWN)
+        #   P4. ADX-trend regimes — with snap-back guard inside trending block
+        #   P5. Range-bound default
+
+        # P1 — Mean-reversion (snap-back guard)
+        # Dropped >threshold ATRs AND RSI oversold AND bouncing on 3d ROC
+        if atr_move_5d < -SNAPBACK_ATR_THRESHOLD and rsi < 35 and roc_3d > SNAPBACK_ROC_THRESHOLD:
+            regime = Regime.OVERSOLD_BOUNCE
+
+        # Rallied >threshold ATRs AND RSI overbought AND fading on 3d ROC
+        elif atr_move_5d > SNAPBACK_ATR_THRESHOLD and rsi > 65 and roc_3d < -SNAPBACK_ROC_THRESHOLD:
+            regime = Regime.OVERBOUGHT_DROP
+
+        # P2 — Bollinger Squeeze
+        elif bb_squeeze:
             regime = Regime.SQUEEZE
+
+        # P3 — Classic reversal
         elif rsi <= RSI_OVERSOLD and direction_score <= -0.2:
             regime = Regime.REVERSAL_UP
         elif rsi >= RSI_OVERBOUGHT and direction_score >= 0.2:
             regime = Regime.REVERSAL_DOWN
+
+        # P4 — ADX-trending regimes
         elif adx_val >= ADX_TRENDING_THRESHOLD:
-            if direction_score >= 0.4:
+            # Snap-back guard inside trending block:
+            # If trending bearish but 3d ROC is positive >1% → don't short, reclassify
+            if direction_score <= -0.4 and roc_3d > 1.0:
+                regime = Regime.OVERSOLD_BOUNCE
+            # If trending bullish but 3d ROC is negative <-1% → don't buy, reclassify
+            elif direction_score >= 0.4 and roc_3d < -1.0:
+                regime = Regime.OVERBOUGHT_DROP
+            elif direction_score >= 0.4:
                 regime = Regime.STRONG_UPTREND
             elif direction_score >= 0.1:
                 regime = Regime.UPTREND
@@ -207,6 +263,8 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
                 regime = Regime.DOWNTREND
             else:
                 regime = Regime.RANGE_BOUND
+
+        # P5 — Default: range-bound
         else:
             regime = Regime.RANGE_BOUND
 
@@ -226,6 +284,8 @@ def classify_regime(ticker: str, df: pd.DataFrame) -> Optional[StockRegime]:
             atr_pct=atr_pct,
             price=round(price, 2),
             volume_trend=volume_trend,
+            roc_3d=roc_3d,
+            atr_move_5d=atr_move_5d,
         )
 
     except Exception as exc:

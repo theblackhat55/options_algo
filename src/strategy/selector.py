@@ -3,19 +3,34 @@ src/strategy/selector.py
 ========================
 Maps stock regime + IV analysis → recommended options strategy.
 
-Strategy Matrix:
-────────────────────────────────────────────────────────────────────
-                      IV HIGH (Sell)    IV NORMAL         IV LOW (Buy)
-────────────────────────────────────────────────────────────────────
-STRONG UPTREND        Bull Put Spread   Bull Call Spread  Bull Call Spread
-UPTREND               Bull Put Spread   Bull Call Spread  Bull Call Spread
-RANGE BOUND           Iron Condor       Iron Condor       Long Butterfly
-DOWNTREND             Bear Call Spread  Bear Put Spread   Bear Put Spread
-STRONG DOWNTREND      Bear Call Spread  Bear Put Spread   Bear Put Spread
-SQUEEZE               Iron Condor       Long Butterfly    Long Butterfly
-REVERSAL UP           Bull Put Spread   Bull Call Spread  Bull Call Spread
-REVERSAL DOWN         Bear Call Spread  Bear Put Spread   Bear Put Spread
-────────────────────────────────────────────────────────────────────
+Strategy Matrix V2:
+────────────────────────────────────────────────────────────────────────────────
+                        IV HIGH (Sell)    IV NORMAL         IV LOW (Buy)
+────────────────────────────────────────────────────────────────────────────────
+STRONG UPTREND          Bull Put Spread   Bull Call Spread  Bull Call Spread
+UPTREND                 Bull Put Spread   Bull Call Spread  Bull Call Spread
+RANGE BOUND             Iron Condor       Iron Condor       Long Butterfly
+DOWNTREND               Bear Call Spread  Bear Put Spread   Bear Put Spread
+STRONG DOWNTREND        Bear Call Spread  Bear Put Spread   Bear Put Spread
+SQUEEZE                 Iron Condor       Long Butterfly    Long Butterfly
+REVERSAL UP             Bull Put Spread   Bull Call Spread  Bull Call Spread
+REVERSAL DOWN           Bear Call Spread  Bear Put Spread   Bear Put Spread
+OVERSOLD_BOUNCE (NEW)   Iron Condor       SKIP              SKIP
+OVERBOUGHT_DROP (NEW)   Iron Condor       SKIP              SKIP
+────────────────────────────────────────────────────────────────────────────────
+
+V2 changes:
+  - Added OVERSOLD_BOUNCE and OVERBOUGHT_DROP regime rows to the matrix.
+    These map to IRON_CONDOR when IV is HIGH (neutral premium sale),
+    or SKIP otherwise — preventing directional trades against snap-backs.
+  - Added spy_return_5d market-context gate to select_strategy():
+    * If SPY bounced >SPY_DIRECTIONAL_GATE_PCT% in 5d AND the signal is
+      bearish → SKIP (don't fight a rising tape with bear spreads)
+    * If SPY dropped >SPY_DIRECTIONAL_GATE_PCT% in 5d AND the signal is
+      bullish → SKIP (don't fade a falling market with bull spreads)
+  - _compute_confidence() now penalises confidence when 3d ROC opposes
+    the strategy direction (short-term momentum counter-signal).
+  - _build_rationale() now includes roc_3d and atr_move_5d when material.
 """
 from __future__ import annotations
 
@@ -26,6 +41,7 @@ from typing import Optional
 
 from src.analysis.technical import Regime, StockRegime
 from src.analysis.volatility import IVAnalysis
+from config.settings import SPY_DIRECTIONAL_GATE_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +117,21 @@ _MATRIX: dict[tuple, tuple] = {
     (Regime.REVERSAL_DOWN, "HIGH"):     (StrategyType.BEAR_CALL_SPREAD,  "BEARISH", "CREDIT"),
     (Regime.REVERSAL_DOWN, "NORMAL"):   (StrategyType.BEAR_PUT_SPREAD,   "BEARISH", "DEBIT"),
     (Regime.REVERSAL_DOWN, "LOW"):      (StrategyType.BEAR_PUT_SPREAD,   "BEARISH", "DEBIT"),
+
+    # ── NEW: Snap-back regimes ──────────────────────────────────────────────
+    # OVERSOLD_BOUNCE: stock dropped hard but is bouncing — don't go short.
+    #   HIGH IV → Iron Condor (neutral premium sale, wide strikes capture bounce range)
+    #   NORMAL / LOW → SKIP (no edge without premium richness)
+    (Regime.OVERSOLD_BOUNCE, "HIGH"):   (StrategyType.IRON_CONDOR,       "NEUTRAL", "CREDIT"),
+    (Regime.OVERSOLD_BOUNCE, "NORMAL"): (StrategyType.SKIP,              "NEUTRAL", "NONE"),
+    (Regime.OVERSOLD_BOUNCE, "LOW"):    (StrategyType.SKIP,              "NEUTRAL", "NONE"),
+
+    # OVERBOUGHT_DROP: stock rallied hard but is fading — don't go long.
+    #   HIGH IV → Iron Condor (neutral premium sale)
+    #   NORMAL / LOW → SKIP
+    (Regime.OVERBOUGHT_DROP, "HIGH"):   (StrategyType.IRON_CONDOR,       "NEUTRAL", "CREDIT"),
+    (Regime.OVERBOUGHT_DROP, "NORMAL"): (StrategyType.SKIP,              "NEUTRAL", "NONE"),
+    (Regime.OVERBOUGHT_DROP, "LOW"):    (StrategyType.SKIP,              "NEUTRAL", "NONE"),
 }
 
 # Target DTE by risk_reward type
@@ -116,10 +147,20 @@ _DTE_BUTTERFLY = 30
 def select_strategy(
     regime: StockRegime,
     iv: IVAnalysis,
+    spy_return_5d: float = 0.0,   # NEW: current 5-day SPY return (%)
 ) -> StrategyRecommendation:
     """
     Select the optimal options strategy for a stock given its
     technical regime and IV analysis.
+
+    Args:
+        regime: StockRegime from classify_regime()
+        iv: IVAnalysis from analyze_iv()
+        spy_return_5d: 5-day SPY return (%). Used to block directional trades
+            when the broad market is moving against the signal direction.
+
+    Returns:
+        StrategyRecommendation (may be SKIP)
     """
     key = (regime.regime, iv.iv_regime)
     result = _MATRIX.get(key)
@@ -139,6 +180,62 @@ def select_strategy(
         )
 
     strategy_type, direction, risk_reward = result
+
+    # ── NEW: SPY market-context gate ─────────────────────────────────────────
+    # If SPY bounced strongly in the last 5 days, bearish individual-stock
+    # signals are fighting an upward tape — skip them.
+    if direction == "BEARISH" and spy_return_5d > SPY_DIRECTIONAL_GATE_PCT:
+        logger.info(
+            f"{regime.ticker}: SKIP — bearish signal but SPY +{spy_return_5d:.1f}% "
+            f"(gate={SPY_DIRECTIONAL_GATE_PCT}%)"
+        )
+        return StrategyRecommendation(
+            ticker=regime.ticker,
+            strategy=StrategyType.SKIP,
+            direction="NEUTRAL",
+            regime=regime.regime.value,
+            iv_regime=iv.iv_regime,
+            confidence=0.0,
+            rationale=f"Skipped: bearish signal vs SPY +{spy_return_5d:.1f}% (5d tape gate)",
+            target_dte=0,
+            risk_reward="NONE",
+            priority=99,
+        )
+
+    # If SPY dropped strongly, bullish signals are fighting a falling tape — skip.
+    if direction == "BULLISH" and spy_return_5d < -SPY_DIRECTIONAL_GATE_PCT:
+        logger.info(
+            f"{regime.ticker}: SKIP — bullish signal but SPY {spy_return_5d:.1f}% "
+            f"(gate={SPY_DIRECTIONAL_GATE_PCT}%)"
+        )
+        return StrategyRecommendation(
+            ticker=regime.ticker,
+            strategy=StrategyType.SKIP,
+            direction="NEUTRAL",
+            regime=regime.regime.value,
+            iv_regime=iv.iv_regime,
+            confidence=0.0,
+            rationale=f"Skipped: bullish signal vs SPY {spy_return_5d:.1f}% (5d tape gate)",
+            target_dte=0,
+            risk_reward="NONE",
+            priority=99,
+        )
+
+    # ── Matrix-level SKIP (e.g. OVERSOLD_BOUNCE/NORMAL) ────────────────────
+    # Return immediately with zero confidence — no scoring needed.
+    if strategy_type == StrategyType.SKIP:
+        return StrategyRecommendation(
+            ticker=regime.ticker,
+            strategy=StrategyType.SKIP,
+            direction="NEUTRAL",
+            regime=regime.regime.value,
+            iv_regime=iv.iv_regime,
+            confidence=0.0,
+            rationale=f"Skipped: {regime.regime.value} + IV={iv.iv_regime} has no edge",
+            target_dte=0,
+            risk_reward="NONE",
+            priority=99,
+        )
 
     if strategy_type == StrategyType.LONG_BUTTERFLY:
         target_dte = _DTE_BUTTERFLY
@@ -184,6 +281,10 @@ def _compute_confidence(
     """
     Score from 0.0–1.0 indicating setup quality.
     Higher = more confluent signals.
+
+    V2 additions:
+    - Penalises confidence when 3d ROC opposes strategy direction
+    - Rewards confidence when IV-RV spread confirms premium richness for credit trades
     """
     score = 0.50  # Base
 
@@ -235,7 +336,21 @@ def _compute_confidence(
     ) and regime.direction_score < 0:
         score += 0.05
 
-    return min(score, 1.0)
+    # 8. NEW: 3d ROC counter-signal penalty
+    # If the 3-day short-term momentum opposes the strategy direction,
+    # reduce confidence — the snap-back risk is real even if longer signals hold.
+    roc_3d = getattr(regime, "roc_3d", 0.0)
+    if strategy in (StrategyType.BEAR_CALL_SPREAD, StrategyType.BEAR_PUT_SPREAD) and roc_3d > 1.5:
+        score -= 0.15   # Stock bouncing; bearish confidence reduced
+    elif strategy in (StrategyType.BULL_CALL_SPREAD, StrategyType.BULL_PUT_SPREAD) and roc_3d < -1.5:
+        score -= 0.15   # Stock dropping; bullish confidence reduced
+
+    # 9. NEW: IV-RV spread bonus for credit strategies
+    # Genuine premium richness (IV > HV by a meaningful margin) adds edge
+    if strategy in _CREDIT_STRATEGIES and getattr(iv, "premium_rich", False):
+        score += 0.05
+
+    return min(max(score, 0.0), 1.0)
 
 
 def _build_rationale(
@@ -254,5 +369,18 @@ def _build_rationale(
         parts.append(f"IV {iv.iv_trend.lower()}")
     if regime.volume_trend == "rising":
         parts.append("vol rising")
+
+    # NEW: include snap-back indicators when material
+    roc_3d = getattr(regime, "roc_3d", 0.0)
+    if abs(roc_3d) > 1.0:
+        parts.append(f"3d ROC={roc_3d:+.1f}%")
+
+    atr_move_5d = getattr(regime, "atr_move_5d", 0.0)
+    if abs(atr_move_5d) > 1.5:
+        parts.append(f"5d ATR move={atr_move_5d:+.1f}")
+
+    # NEW: flag premium richness
+    if getattr(iv, "premium_rich", False) and strategy in _CREDIT_STRATEGIES:
+        parts.append(f"IV-RV spread={iv.iv_rv_spread:+.1f}pts ✓")
 
     return " | ".join(parts)

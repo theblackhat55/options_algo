@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
 
 from config.settings import SIGNALS_DIR, TRADES_DIR
 from src.pipeline.outcome_tracker import load_outcomes, get_win_rate
+from dashboard.ticker_analysis import render as render_ticker_analysis
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -48,7 +49,7 @@ st.sidebar.title("📊 Options Algo")
 st.sidebar.markdown("---")
 page = st.sidebar.selectbox(
     "Navigation",
-    ["Today's Picks", "IV Heatmap", "Regime Map", "Trade Log", "Strategy Stats", "Run Scan"],
+    ["Ticker Analysis", "Today's Picks", "IV Heatmap", "Regime Map", "Trade Log", "Strategy Stats", "Run Scan"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Date: {date.today()}")
@@ -554,7 +555,9 @@ openclaw cron add \\
 
 # ─── Router ───────────────────────────────────────────────────────────────────
 
-if page == "Today's Picks":
+if page == "Ticker Analysis":
+    render_ticker_analysis()
+elif page == "Today's Picks":
     page_todays_picks()
 elif page == "IV Heatmap":
     page_iv_heatmap()

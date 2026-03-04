@@ -464,3 +464,270 @@ class TestCompositeScreener:
         from src.screener.composite_screener import run_screener
         results = run_screener({}, {})
         assert results == []
+
+
+# ─── Tests: Directional Balance (_rank_trades) ────────────────────────────────
+
+class TestDirectionalBalance:
+    """
+    _rank_trades() must enforce the MAX_SAME_DIRECTION_PCT cap so that no more
+    than max_same_dir = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT/100))
+    trades of the same direction appear in the output.
+
+    NEUTRAL trades (IC, butterfly) are never capped.
+    """
+
+    # ── helper: build a minimal trade dict that _rank_trades() can process ──
+
+    @staticmethod
+    def _trade(direction: str, confidence: float = 0.7, ticker: str = "X") -> dict:
+        return {
+            "recommendation": {
+                "ticker": ticker,
+                "direction": direction,
+                "confidence": confidence,
+                "strategy": "IRON_CONDOR" if direction == "NEUTRAL" else "BULL_PUT_SPREAD",
+            },
+            "trade": {
+                "prob_profit": 65,
+                "risk_reward_ratio": 3.0,
+                "ev": 0.0,
+            },
+        }
+
+    def _rank(self, trades: list[dict]) -> list[dict]:
+        from src.pipeline.nightly_scan import _rank_trades
+        return _rank_trades(trades)
+
+    # ── cap enforcement ───────────────────────────────────────────────────────
+
+    def test_excess_bullish_trades_are_dropped(self):
+        """
+        With 5 MAX_POSITIONS and 60% cap → max_same_dir = max(2, 3) = 3.
+        Submitting 5 BULLISH should yield at most 3 in the output.
+        """
+        from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+        max_same = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
+
+        trades = [
+            self._trade("BULLISH", confidence=0.9 - i * 0.05, ticker=f"T{i}")
+            for i in range(5)
+        ]
+        result = self._rank(trades)
+        bullish_count = sum(
+            1 for t in result
+            if t["recommendation"]["direction"] == "BULLISH"
+        )
+        assert bullish_count <= max_same, (
+            f"Expected ≤{max_same} BULLISH trades, got {bullish_count}"
+        )
+
+    def test_excess_bearish_trades_are_dropped(self):
+        """Same cap applies to BEARISH."""
+        from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+        max_same = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
+
+        trades = [
+            self._trade("BEARISH", confidence=0.9 - i * 0.05, ticker=f"B{i}")
+            for i in range(5)
+        ]
+        result = self._rank(trades)
+        bearish_count = sum(
+            1 for t in result
+            if t["recommendation"]["direction"] == "BEARISH"
+        )
+        assert bearish_count <= max_same
+
+    def test_neutral_trades_never_capped(self):
+        """
+        10 NEUTRAL trades submitted: all should pass (no cap on NEUTRAL).
+        """
+        trades = [
+            self._trade("NEUTRAL", confidence=0.8, ticker=f"N{i}")
+            for i in range(10)
+        ]
+        result = self._rank(trades)
+        neutral_count = sum(
+            1 for t in result
+            if t["recommendation"]["direction"] == "NEUTRAL"
+        )
+        assert neutral_count == 10, (
+            f"Expected 10 NEUTRAL trades in output, got {neutral_count}"
+        )
+
+    def test_mixed_directions_high_confidence_preferred(self):
+        """
+        When cap kicks in, higher-confidence trades should survive, not lower.
+        Trades are sorted by composite_score before cap is applied.
+        """
+        trades = [
+            self._trade("BEARISH", confidence=0.60, ticker="B_low"),
+            self._trade("BEARISH", confidence=0.90, ticker="B_high1"),
+            self._trade("BEARISH", confidence=0.85, ticker="B_high2"),
+            self._trade("BEARISH", confidence=0.80, ticker="B_high3"),
+            self._trade("BEARISH", confidence=0.50, ticker="B_lowest"),
+        ]
+        from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+        max_same = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
+
+        result = self._rank(trades)
+        bearish_in = [
+            t for t in result if t["recommendation"]["direction"] == "BEARISH"
+        ]
+        # The surviving bearish trades should all have higher confidence
+        # than B_low (0.60) and B_lowest (0.50) if max_same < 5
+        if max_same < 5:
+            surviving_tickers = {t["recommendation"]["ticker"] for t in bearish_in}
+            # B_high1 (0.90) and B_high2 (0.85) must be in — they have highest score
+            assert "B_high1" in surviving_tickers
+            assert "B_high2" in surviving_tickers
+
+    def test_mixed_portfolio_respects_balance(self):
+        """
+        Realistic mixed portfolio: 4 BULLISH, 4 BEARISH, 4 NEUTRAL.
+        After ranking, both directions should be within the cap and
+        all NEUTRAL should pass.
+        """
+        from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+        max_same = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
+
+        trades = (
+            [self._trade("BULLISH", confidence=0.8, ticker=f"BULL{i}") for i in range(4)]
+            + [self._trade("BEARISH", confidence=0.8, ticker=f"BEAR{i}") for i in range(4)]
+            + [self._trade("NEUTRAL", confidence=0.8, ticker=f"NEUT{i}") for i in range(4)]
+        )
+        result = self._rank(trades)
+
+        bull_count = sum(1 for t in result if t["recommendation"]["direction"] == "BULLISH")
+        bear_count = sum(1 for t in result if t["recommendation"]["direction"] == "BEARISH")
+        neut_count = sum(1 for t in result if t["recommendation"]["direction"] == "NEUTRAL")
+
+        assert bull_count <= max_same
+        assert bear_count <= max_same
+        assert neut_count == 4  # all NEUTRAL pass
+
+    def test_priority_assigned_sequentially(self):
+        """After ranking, priority should be 1, 2, 3, ... (1-indexed)."""
+        trades = [
+            self._trade("BULLISH", confidence=0.9, ticker="A"),
+            self._trade("NEUTRAL", confidence=0.8, ticker="B"),
+            self._trade("BEARISH", confidence=0.7, ticker="C"),
+        ]
+        result = self._rank(trades)
+        priorities = [t["priority"] for t in result]
+        assert priorities == list(range(1, len(result) + 1)), (
+            f"Priorities should be sequential 1..n, got {priorities}"
+        )
+
+    def test_composite_score_present_on_all_trades(self):
+        """Every ranked trade should have composite_score set."""
+        trades = [
+            self._trade("BULLISH", ticker="A"),
+            self._trade("NEUTRAL", ticker="B"),
+        ]
+        result = self._rank(trades)
+        for t in result:
+            assert "composite_score" in t
+            assert t["composite_score"] >= 0.0
+
+    def test_empty_trade_list_returns_empty(self):
+        result = self._rank([])
+        assert result == []
+
+    def test_single_bullish_always_passes(self):
+        """A single BULLISH trade should never be blocked (max_same_dir >= 2)."""
+        result = self._rank([self._trade("BULLISH", ticker="SOLO")])
+        assert len(result) == 1
+        assert result[0]["recommendation"]["direction"] == "BULLISH"
+
+    def test_max_2_minimum_enforced(self):
+        """
+        Even if MAX_POSITIONS * PCT / 100 rounds below 2, at least 2 same-
+        direction trades must always be allowed (max(2, ...)).
+        """
+        import src.pipeline.nightly_scan as ns_mod
+        original = ns_mod.MAX_POSITIONS
+        try:
+            ns_mod.MAX_POSITIONS = 5
+            trades = [
+                self._trade("BULLISH", confidence=0.9, ticker=f"B{i}")
+                for i in range(4)
+            ]
+            result = self._rank(trades)
+            bullish_out = [
+                t for t in result
+                if t["recommendation"]["direction"] == "BULLISH"
+            ]
+            # Must be at least 2 (the max(2, ...) floor)
+            assert len(bullish_out) >= 2
+        finally:
+            ns_mod.MAX_POSITIONS = original
+
+
+# ─── Tests: _adjust_confidence_for_rs ────────────────────────────────────────
+
+class TestAdjustConfidenceForRS:
+    """
+    _adjust_confidence_for_rs modifies rec.confidence in-place:
+      +0.05 for BULLISH + outperforming + IMPROVING
+      +0.05 for BEARISH + underperforming + WEAKENING
+      -0.05 for BULLISH + not outperforming
+    """
+
+    def _make_rec(self, direction: str, confidence: float = 0.70):
+        """Build a minimal StrategyRecommendation-like object."""
+        from src.strategy.selector import StrategyRecommendation, StrategyType
+        return StrategyRecommendation(
+            ticker="AAPL",
+            strategy=StrategyType.BULL_PUT_SPREAD,
+            direction=direction,
+            regime="UPTREND",
+            iv_regime="HIGH",
+            confidence=confidence,
+            rationale="test",
+            target_dte=45,
+            risk_reward="CREDIT",
+            priority=1,
+        )
+
+    def _make_rs(self, outperforming: bool, rs_trend: str):
+        """Minimal RelativeStrength-compatible mock."""
+        rs = MagicMock()
+        rs.outperforming_spy = outperforming
+        rs.rs_trend = rs_trend
+        return rs
+
+    def test_bullish_outperforming_improving_boosts(self):
+        from src.pipeline.nightly_scan import _adjust_confidence_for_rs
+        rec = self._make_rec("BULLISH", 0.70)
+        rs = self._make_rs(outperforming=True, rs_trend="IMPROVING")
+        _adjust_confidence_for_rs(rec, rs)
+        assert rec.confidence == pytest.approx(0.75, abs=0.001)
+
+    def test_bearish_underperforming_weakening_boosts(self):
+        from src.pipeline.nightly_scan import _adjust_confidence_for_rs
+        rec = self._make_rec("BEARISH", 0.70)
+        rs = self._make_rs(outperforming=False, rs_trend="WEAKENING")
+        _adjust_confidence_for_rs(rec, rs)
+        assert rec.confidence == pytest.approx(0.75, abs=0.001)
+
+    def test_bullish_not_outperforming_penalises(self):
+        from src.pipeline.nightly_scan import _adjust_confidence_for_rs
+        rec = self._make_rec("BULLISH", 0.70)
+        rs = self._make_rs(outperforming=False, rs_trend="FLAT")
+        _adjust_confidence_for_rs(rec, rs)
+        assert rec.confidence == pytest.approx(0.65, abs=0.001)
+
+    def test_confidence_capped_at_1_0(self):
+        from src.pipeline.nightly_scan import _adjust_confidence_for_rs
+        rec = self._make_rec("BULLISH", 0.98)
+        rs = self._make_rs(outperforming=True, rs_trend="IMPROVING")
+        _adjust_confidence_for_rs(rec, rs)
+        assert rec.confidence <= 1.0
+
+    def test_confidence_floored_at_0_0(self):
+        from src.pipeline.nightly_scan import _adjust_confidence_for_rs
+        rec = self._make_rec("BULLISH", 0.02)
+        rs = self._make_rs(outperforming=False, rs_trend="FLAT")
+        _adjust_confidence_for_rs(rec, rs)
+        assert rec.confidence >= 0.0

@@ -89,6 +89,26 @@ MIN_TRADES_FOR_ML = int(os.getenv("MIN_TRADES_FOR_ML", "200"))
 # ─── Delivery ─────────────────────────────────────────────────────────────────
 WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "")            # Set in .env
 
+# ─── Directional Balance & Snap-back Guards (V2) ────────────────────────────
+# Maximum fraction of MAX_POSITIONS allowed in one direction (BULLISH or BEARISH)
+MAX_SAME_DIRECTION_PCT = float(os.getenv("MAX_SAME_DIRECTION_PCT", "60"))
+
+# Minimum IV-RV spread (vol points) required to flag premium_rich = True.
+# Below this threshold, "high IV" is just elevated realized vol — not true edge.
+MIN_IV_RV_SPREAD_CREDIT = float(os.getenv("MIN_IV_RV_SPREAD_CREDIT", "5.0"))
+
+# ATR-units threshold for snap-back regime detection (OVERSOLD/OVERBOUGHT regimes).
+# If a stock moves more than this many ATRs in 5 days it qualifies for snap-back check.
+SNAPBACK_ATR_THRESHOLD = float(os.getenv("SNAPBACK_ATR_THRESHOLD", "2.0"))
+
+# 3-day ROC (%) needed to confirm the snap-back is actually underway.
+# Must be positive (for OVERSOLD_BOUNCE) or negative (for OVERBOUGHT_DROP).
+SNAPBACK_ROC_THRESHOLD = float(os.getenv("SNAPBACK_ROC_THRESHOLD", "1.0"))
+
+# SPY 5-day return gate for directional trades (%).
+# Bearish signals are skipped when SPY is above this; bullish when SPY is below -this.
+SPY_DIRECTIONAL_GATE_PCT = float(os.getenv("SPY_DIRECTIONAL_GATE_PCT", "1.0"))
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = PROJECT_ROOT / "logs"

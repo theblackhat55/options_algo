@@ -5,7 +5,7 @@ requests>=2.31.0
 finnhub-python>=2.4.18
 
 # ─── Technical Analysis ───────────────────────────────────────────────────────
-pandas-ta>=0.3.14b
+pandas-ta-classic>=0.1.3
 # ta-lib requires C library; install separately if needed
 # ta-lib>=0.4.28
 
