@@ -332,6 +332,8 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "atr": regime.atr,
                 "atr_pct": regime.atr_pct,
                 "volume_trend": regime.volume_trend,
+                "roc_3d": regime.roc_3d,          # V2: short-term 3-day momentum (%)
+                "atr_move_5d": regime.atr_move_5d, # V2: 5-day move in ATR units
             },
             "iv_detail": {
                 "iv_rank": iv.iv_rank,
@@ -341,6 +343,8 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "iv_hv_ratio": iv.iv_hv_ratio,
                 "iv_trend": iv.iv_trend,
                 "premium_action": iv.premium_action,
+                "iv_rv_spread": iv.iv_rv_spread,   # V2: IV minus realized vol (vol pts)
+                "premium_rich": iv.premium_rich,   # V2: True only when real IV > HV+5
             },
             "rs_detail": {
                 "rs_vs_spy": rs.rs_vs_spy if rs else None,

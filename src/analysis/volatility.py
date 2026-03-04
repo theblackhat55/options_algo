@@ -137,12 +137,15 @@ def analyze_iv(
             hv_20 = 20.0   # Sensible default
 
         # ── Implied Volatility ────────────────────────────────────────────────
+        iv_is_proxy = False  # True when using HV*1.15 fallback (no real chain data)
         if options_chain is not None and not options_chain.empty:
             current_iv_raw = get_atm_iv(options_chain, current_price)
             if current_iv_raw <= 0 or np.isnan(current_iv_raw):
                 current_iv_raw = hv_20 / 100 * 1.15
+                iv_is_proxy = True   # real chain present but ATM IV invalid
         else:
-            current_iv_raw = (hv_20 / 100) * 1.15    # IV proxy
+            current_iv_raw = (hv_20 / 100) * 1.15    # IV proxy — no options chain
+            iv_is_proxy = True
 
         current_iv = current_iv_raw * 100   # Already % if from get_atm_iv
 
@@ -195,8 +198,10 @@ def analyze_iv(
         # Positive value = implied vol is trading above realized vol (genuine premium)
         # If spread is thin or negative, "HIGH IV" is mostly just high realized vol
         # and there isn't much edge in selling that premium.
+        # IMPORTANT: when IV is a proxy (HV * 1.15) the spread is mechanical
+        # (always ~15% of HV) and carries no signal — suppress premium_rich.
         iv_rv_spread = round(current_iv - hv_20, 1)
-        premium_rich = iv_rv_spread > MIN_IV_RV_SPREAD_CREDIT
+        premium_rich = (iv_rv_spread > MIN_IV_RV_SPREAD_CREDIT) and not iv_is_proxy
 
         # ── Put/Call Skew Proxy ───────────────────────────────────────────────
         # Positive skew = puts more expensive (market hedging, bearish fear)
