@@ -135,10 +135,19 @@ def run_nightly_scan(
     # ── Step 7: Strategy Selection ────────────────────────────────────────────
     logger.info("Step 7: Selecting strategies")
     recommendations = []
+    # Pass SPY 5-day return to the strategy selector so it can block directional
+    # trades that fight the broad market tape (V2: SPY gate)
+    spy_ret_5d = market_ctx.spy_return_5d
+    logger.info(f"  SPY 5d return: {spy_ret_5d:+.2f}% (gate: ±{__import__('config.settings', fromlist=['SPY_DIRECTIONAL_GATE_PCT']).SPY_DIRECTIONAL_GATE_PCT:.1f}%)")
+
     for ticker in qualified:
         if ticker not in regime_map or ticker not in iv_map:
             continue
-        rec = select_strategy(regime_map[ticker], iv_map[ticker])
+        rec = select_strategy(
+            regime_map[ticker],
+            iv_map[ticker],
+            spy_return_5d=spy_ret_5d,   # V2: market context gate
+        )
         if rec.strategy != StrategyType.SKIP:
             # Boost confidence if RS is strong/weak and aligned with direction
             rs = rs_map.get(ticker)
@@ -370,7 +379,15 @@ def _build_trade_stub(rec, df, regime_map, iv_map, rs_map):
 
 
 def _rank_trades(trades: list[dict]) -> list[dict]:
-    """Rank trades by composite score and assign priority."""
+    """
+    Rank trades by composite score and assign priority.
+
+    V2: Enforces directional balance — no more than MAX_SAME_DIRECTION_PCT
+    of MAX_POSITIONS slots may be filled by the same direction (BULLISH/BEARISH).
+    Neutral (iron condors, butterflies) are never limited.
+    """
+    from config.settings import MAX_SAME_DIRECTION_PCT
+
     for t in trades:
         trade = t.get("trade", {})
         rec = t.get("recommendation", {})
@@ -388,10 +405,31 @@ def _rank_trades(trades: list[dict]) -> list[dict]:
 
     trades.sort(key=lambda t: t.get("composite_score", 0), reverse=True)
 
-    for i, t in enumerate(trades):
+    # ── V2: Directional balance gate ────────────────────────────────────────
+    # Cap the number of same-direction trades at MAX_SAME_DIRECTION_PCT% of
+    # MAX_POSITIONS so we never run 4 bear spreads + 1 bull spread again.
+    max_same_dir = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
+    balanced = []
+    direction_counts: dict[str, int] = {"BULLISH": 0, "BEARISH": 0, "NEUTRAL": 0}
+
+    for t in trades:
+        direction = t.get("recommendation", {}).get("direction", "NEUTRAL")
+        current_count = direction_counts.get(direction, 0)
+
+        if direction == "NEUTRAL" or current_count < max_same_dir:
+            balanced.append(t)
+            direction_counts[direction] = current_count + 1
+        else:
+            ticker = t.get("recommendation", {}).get("ticker", "?")
+            logger.info(
+                f"  Directional balance: skipped {ticker} ({direction}) — "
+                f"{current_count}/{max_same_dir} {direction} slots filled"
+            )
+
+    for i, t in enumerate(balanced):
         t["priority"] = i + 1
 
-    return trades
+    return balanced
 
 
 def _adjust_confidence_for_rs(rec, rs) -> None:

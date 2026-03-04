@@ -4,6 +4,12 @@ src/analysis/volatility.py
 Implied volatility analysis: IV rank, IV percentile, IV/HV ratio.
 Determines whether to buy premium (low IV) or sell premium (high IV).
 
+V2 changes:
+  - Added iv_rv_spread field: current_iv minus hv_20 (vol points)
+  - Added premium_rich flag: True when IV-RV spread > MIN_IV_RV_SPREAD_CREDIT vol points
+    This prevents selling premium when IV looks "high" purely because HV spiked
+    (i.e., a selloff pushed realized vol up but options haven't re-priced yet).
+
 Usage:
     from src.analysis.volatility import analyze_iv, analyze_universe_iv
 
@@ -18,7 +24,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config.settings import IV_LOOKBACK_DAYS, HV_WINDOW, IV_HIGH_THRESHOLD, IV_LOW_THRESHOLD
+from config.settings import (
+    IV_LOOKBACK_DAYS, HV_WINDOW, IV_HIGH_THRESHOLD, IV_LOW_THRESHOLD,
+    MIN_IV_RV_SPREAD_CREDIT,
+)
 from src.data.options_fetcher import get_atm_iv
 
 logger = logging.getLogger(__name__)
@@ -40,6 +49,8 @@ class IVAnalysis:
     iv_trend: str             # "RISING" | "FLAT" | "FALLING"
     iv_30d_avg: float         # 30-day moving average of IV (%)
     skew: float               # Put/call IV skew proxy (positive = puts expensive)
+    iv_rv_spread: float = 0.0  # NEW: current_iv - hv_20 (vol points); positive = premium rich
+    premium_rich: bool = False  # NEW: True when iv_rv_spread > MIN_IV_RV_SPREAD_CREDIT
 
 
 # ─── Core Computations ────────────────────────────────────────────────────────
@@ -100,6 +111,10 @@ def analyze_iv(
 
     If an options chain is provided, ATM IV is extracted from it.
     Otherwise, 30-day HV × 1.15 is used as an IV proxy.
+
+    V2: also computes iv_rv_spread and premium_rich flag to distinguish
+    "IV is high because a selloff spiked realized vol" (proxy inflation)
+    from "IV is genuinely elevated vs realized vol" (true premium richness).
 
     Returns:
         IVAnalysis or None if insufficient data.
@@ -176,6 +191,13 @@ def analyze_iv(
         else:
             iv_trend = "FLAT"
 
+        # ── NEW: IV-RV Spread ─────────────────────────────────────────────────
+        # Positive value = implied vol is trading above realized vol (genuine premium)
+        # If spread is thin or negative, "HIGH IV" is mostly just high realized vol
+        # and there isn't much edge in selling that premium.
+        iv_rv_spread = round(current_iv - hv_20, 1)
+        premium_rich = iv_rv_spread > MIN_IV_RV_SPREAD_CREDIT
+
         # ── Put/Call Skew Proxy ───────────────────────────────────────────────
         # Positive skew = puts more expensive (market hedging, bearish fear)
         skew = 0.0
@@ -195,6 +217,8 @@ def analyze_iv(
             iv_trend=iv_trend,
             iv_30d_avg=iv_30d_avg,
             skew=round(skew, 2),
+            iv_rv_spread=iv_rv_spread,
+            premium_rich=premium_rich,
         )
 
     except Exception as exc:
