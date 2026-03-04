@@ -56,6 +56,14 @@ class TradeOutcome:
     prob_profit: float
     confidence: float
 
+    # V2: Market context at entry (for regime correlation analysis)
+    entry_vix: float = 0.0           # VIX level at trade entry
+    entry_spy_5d: float = 0.0        # SPY 5-day return at entry (%)
+    entry_vix_tier: str = ""         # NORMAL / CAUTION / DEFENSIVE
+    entry_roc_3d: float = 0.0        # Stock 3-day ROC at entry (%)
+    entry_beta: float = 1.0          # 60-day beta vs SPY at entry
+    entry_sector: str = ""           # GICS sector at entry
+
     # Outcome fields (filled on close)
     exit_date: str = ""
     exit_price: float = 0.0
@@ -65,6 +73,12 @@ class TradeOutcome:
     outcome: str = "OPEN"         # OPEN, WIN, LOSS, EXPIRED, STOPPED_OUT
     days_held: int = 0
     close_reason: str = ""        # 50% profit, stop loss, expiry, etc.
+
+    # ── V2: Market context at entry (for ML feature set) ─────────────────────
+    entry_vix: float = 0.0        # VIX level when trade was entered
+    entry_vix_tier: str = ""      # NORMAL / CAUTION / DEFENSIVE / LIQUIDATION
+    entry_spy_5d: float = 0.0     # SPY 5-day return at entry (%)
+    entry_roc_3d: float = 0.0     # Stock 3-day ROC at entry (%) — momentum context
 
 
 def record_entry(
@@ -89,6 +103,7 @@ def record_entry(
     iv = context.get("iv_detail", {})
     reg = context.get("regime_detail", {})
     rs = context.get("rs_detail", {})
+    mkt = context.get("market_snapshot", {})   # V2: market context at entry
 
     # Handle both credit and debit spreads
     credit = trade.get("net_credit") or -(trade.get("net_debit", 0))
@@ -123,6 +138,13 @@ def record_entry(
         max_risk=max_r,
         prob_profit=trade.get("prob_profit", 0),
         confidence=recommendation.get("confidence", 0),
+        # V2 market context fields
+        entry_vix=float(mkt.get("vix", 0)),
+        entry_vix_tier=str(mkt.get("vix_tier", "")),
+        entry_spy_5d=float(mkt.get("spy_5d_return", 0)),
+        entry_roc_3d=float(reg.get("roc_3d", 0)),
+        entry_beta=float(context.get("beta", 1.0)),
+        entry_sector=str(context.get("sector", "")),
     )
 
     _append_outcome(outcome)

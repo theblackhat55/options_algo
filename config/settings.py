@@ -109,6 +109,26 @@ SNAPBACK_ROC_THRESHOLD = float(os.getenv("SNAPBACK_ROC_THRESHOLD", "1.0"))
 # Bearish signals are skipped when SPY is above this; bullish when SPY is below -this.
 SPY_DIRECTIONAL_GATE_PCT = float(os.getenv("SPY_DIRECTIONAL_GATE_PCT", "1.0"))
 
+# ─── VIX Circuit Breaker Levels (V2) ─────────────────────────────────────────
+# VIX threshold above which we move to CAUTION (credit/neutral only).
+VIX_CAUTION_LEVEL = float(os.getenv("VIX_CAUTION_LEVEL", "28.0"))
+
+# VIX threshold above which we move to DEFENSIVE (neutral-only, no new directional).
+VIX_DEFENSIVE_LEVEL = float(os.getenv("VIX_DEFENSIVE_LEVEL", "35.0"))
+
+# VIX threshold above which we halt all new trades (LIQUIDATION mode).
+VIX_LIQUIDATION_LEVEL = float(os.getenv("VIX_LIQUIDATION_LEVEL", "45.0"))
+
+# Rolling window (days) used to compute the VIX 5-day average for spike detection.
+VIX_SPIKE_WINDOW = int(os.getenv("VIX_SPIKE_WINDOW", "5"))
+
+# If VIX rises more than this % above its recent average, flag as a spike.
+VIX_SPIKE_THRESHOLD_PCT = float(os.getenv("VIX_SPIKE_THRESHOLD_PCT", "25.0"))
+
+# ─── Sector Concentration (V2) ───────────────────────────────────────────────
+# Maximum number of picks allowed from the same GICS sector.
+MAX_PER_SECTOR = int(os.getenv("MAX_PER_SECTOR", "2"))
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = PROJECT_ROOT / "logs"

@@ -30,11 +30,15 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
+
 from src.pipeline.outcome_tracker import record_entry
 
 from config.settings import (
     SIGNALS_DIR, MAX_POSITIONS,
     MIN_STOCK_PRICE, MIN_AVG_VOLUME, LOG_LEVEL,
+    VIX_CAUTION_LEVEL, VIX_DEFENSIVE_LEVEL, VIX_LIQUIDATION_LEVEL,
+    MAX_PER_SECTOR, SPY_DIRECTIONAL_GATE_PCT,
 )
 from config.universe import get_universe, get_sector, get_tradeable_universe
 
@@ -103,14 +107,58 @@ def run_nightly_scan(
     market_ctx = get_market_context(qualified)
     logger.info(
         f"  Market: {market_ctx.market_regime} | "
-        f"VIX proxy: {market_ctx.vix_level} | "
+        f"VIX: {market_ctx.vix_level} (tier: {market_ctx.vix_tier}) | "
         f"SPY: {market_ctx.spy_trend} | "
         f"Breadth: {market_ctx.breadth_score:.0%}"
     )
+    if market_ctx.vix_spike:
+        logger.warning(
+            f"  VIX SPIKE: {market_ctx.vix_level:.1f} vs 5d avg {market_ctx.vix_5d_avg:.1f}"
+        )
+
+    # ── VIX Circuit Breaker ────────────────────────────────────────────────────
+    if market_ctx.vix_tier == "LIQUIDATION":
+        logger.warning(
+            f"VIX LIQUIDATION mode ({market_ctx.vix_level:.1f} ≥ {VIX_LIQUIDATION_LEVEL}) "
+            "— halting all new trade generation"
+        )
+        return _build_empty_signal(
+            scan_date, start_time, market_ctx,
+            reason=f"VIX liquidation ({market_ctx.vix_level:.1f})",
+            tickers=tickers, qualified=qualified,
+        )
+
+    if market_ctx.vix_tier == "DEFENSIVE":
+        logger.warning(
+            f"VIX DEFENSIVE mode ({market_ctx.vix_level:.1f} ≥ {VIX_DEFENSIVE_LEVEL}) "
+            "— neutral/credit-only strategies"
+        )
 
     # Gate: don't generate picks in crash conditions
     if market_ctx.market_regime == "CRASH":
         logger.warning("CRASH conditions detected. Generating bear plays only.")
+
+    # ── Step 3b: Beta Map ─────────────────────────────────────────────────────
+    # Compute rough 60-day beta vs SPY for every qualified ticker.
+    # Used for net-exposure logging and trade metadata enrichment.
+    beta_map: dict[str, float] = {}
+    spy_close = qualified.get("SPY", pd.DataFrame()).get("close")
+    if spy_close is not None and len(spy_close) >= 60:
+        spy_ret = spy_close.pct_change().tail(60).dropna()
+        for t, df in qualified.items():
+            if t == "SPY" or df is None or len(df) < 60:
+                beta_map[t] = 1.0
+                continue
+            try:
+                stock_ret = df["close"].pct_change().tail(60).dropna()
+                aligned = stock_ret.align(spy_ret, join="inner")
+                cov = aligned[0].cov(aligned[1])
+                var = aligned[1].var()
+                beta_map[t] = round(cov / var, 2) if var > 0 else 1.0
+            except Exception:
+                beta_map[t] = 1.0
+    else:
+        beta_map = {t: 1.0 for t in qualified}
 
     # ── Step 4: Classify Regimes ──────────────────────────────────────────────
     logger.info("Step 4: Classifying regimes")
@@ -138,7 +186,7 @@ def run_nightly_scan(
     # Pass SPY 5-day return to the strategy selector so it can block directional
     # trades that fight the broad market tape (V2: SPY gate)
     spy_ret_5d = market_ctx.spy_return_5d
-    logger.info(f"  SPY 5d return: {spy_ret_5d:+.2f}% (gate: ±{__import__('config.settings', fromlist=['SPY_DIRECTIONAL_GATE_PCT']).SPY_DIRECTIONAL_GATE_PCT:.1f}%)")
+    logger.info(f"  SPY 5d return: {spy_ret_5d:+.2f}% (gate: ±{SPY_DIRECTIONAL_GATE_PCT:.1f}%)")
 
     for ticker in qualified:
         if ticker not in regime_map or ticker not in iv_map:
@@ -154,6 +202,25 @@ def run_nightly_scan(
             if rs:
                 _adjust_confidence_for_rs(rec, rs)
             recommendations.append(rec)
+
+    # ── VIX Tier Overlay ──────────────────────────────────────────────────────
+    # DEFENSIVE mode: strip all directional recs, keep only NEUTRAL.
+    # CAUTION mode: keep credit strategies and NEUTRAL only.
+    if market_ctx.vix_tier == "DEFENSIVE":
+        before = len(recommendations)
+        recommendations = [r for r in recommendations if r.direction == "NEUTRAL"]
+        logger.info(
+            f"  DEFENSIVE filter: {before} → {len(recommendations)} neutral-only recs"
+        )
+    elif market_ctx.vix_tier == "CAUTION":
+        before = len(recommendations)
+        recommendations = [
+            r for r in recommendations
+            if r.direction == "NEUTRAL" or getattr(r, "risk_reward", "") == "CREDIT"
+        ]
+        logger.info(
+            f"  CAUTION filter: {before} → {len(recommendations)} credit/neutral recs"
+        )
 
     recommendations.sort(key=lambda r: r.confidence, reverse=True)
     logger.info(f"  {len(recommendations)} strategy recommendations")
@@ -180,7 +247,7 @@ def run_nightly_scan(
 
         if dry_run:
             # Skip real options fetching in dry_run mode
-            trades.append(_build_trade_stub(rec, qualified[ticker], regime_map, iv_map, rs_map))
+            trades.append(_build_trade_stub(rec, qualified[ticker], regime_map, iv_map, rs_map, market_ctx, beta_map))
             continue
 
         # Fetch and filter options chain
@@ -196,17 +263,40 @@ def run_nightly_scan(
             logger.debug(f"  {ticker}: trade construction failed")
             continue
 
-        trade_dict = _build_trade_dict(rec, trade_obj, qualified, regime_map, iv_map, rs_map, ticker, price)
+        trade_dict = _build_trade_dict(rec, trade_obj, qualified, regime_map, iv_map, rs_map, ticker, price, market_ctx, beta_map)
         trades.append(trade_dict)
 
         time.sleep(0.3)  # Rate limiting between options fetches
 
     logger.info(f"  {len(trades)} trades constructed")
 
+    # ── Step 9b: Sector Concentration Cap ────────────────────────────────────
+    # Never put more than MAX_PER_SECTOR picks from the same GICS sector.
+    sector_counts: dict[str, int] = {}
+    sector_filtered: list[dict] = []
+    for t in trades:
+        sector = t["context"].get("sector", "Unknown")
+        if sector_counts.get(sector, 0) < MAX_PER_SECTOR:
+            sector_filtered.append(t)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        else:
+            tk = t["recommendation"]["ticker"]
+            logger.info(f"  Sector cap: skipped {tk} ({sector}) — {MAX_PER_SECTOR}/{MAX_PER_SECTOR} slots used")
+    trades = sector_filtered
+
     # ── Step 10: Rank and Finalize ────────────────────────────────────────────
     logger.info("Step 10: Ranking picks")
     trades = _rank_trades(trades)
     top_picks = trades[:MAX_POSITIONS]
+
+    # Net beta-weighted directional exposure (informational only)
+    net_beta = sum(
+        beta_map.get(t["recommendation"]["ticker"], 1.0)
+        * (1 if t["recommendation"]["direction"] == "BULLISH" else
+           -1 if t["recommendation"]["direction"] == "BEARISH" else 0)
+        for t in top_picks
+    )
+    logger.info(f"  Net beta-weighted exposure: {net_beta:+.2f}")
 
     elapsed = round(time.time() - start_time, 1)
 
@@ -226,6 +316,9 @@ def run_nightly_scan(
             "market_regime": market_ctx.market_regime,
             "vix_level": market_ctx.vix_level,
             "vix_regime": market_ctx.vix_regime,
+            "vix_5d_avg": market_ctx.vix_5d_avg,
+            "vix_spike": market_ctx.vix_spike,
+            "vix_tier": market_ctx.vix_tier,
             "spy_trend": market_ctx.spy_trend,
             "spy_return_5d": market_ctx.spy_return_5d,
             "spy_return_20d": market_ctx.spy_return_20d,
@@ -261,6 +354,54 @@ def run_nightly_scan(
     return signal
 
 
+# ─── Empty Signal (VIX Halt) ─────────────────────────────────────────────────
+
+def _build_empty_signal(
+    scan_date: str,
+    start_time: float,
+    market_ctx,
+    reason: str,
+    tickers: list,
+    qualified: dict,
+) -> dict:
+    """
+    Return a zero-picks signal when a circuit breaker fires (e.g. VIX liquidation).
+    Preserves full market context so operators know why no trades were generated.
+    """
+    import time as _time
+    elapsed = round(_time.time() - start_time, 1)
+    return {
+        "scan_date": scan_date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": elapsed,
+        "universe_size": len(tickers),
+        "qualified": len(qualified),
+        "regimes_classified": 0,
+        "recommendations": 0,
+        "after_event_filter": 0,
+        "trades_constructed": 0,
+        "top_picks": [],
+        "circuit_breaker": reason,
+        "regime_distribution": {},
+        "market_context": {
+            "market_regime": market_ctx.market_regime,
+            "vix_level": market_ctx.vix_level,
+            "vix_regime": market_ctx.vix_regime,
+            "vix_5d_avg": market_ctx.vix_5d_avg,
+            "vix_spike": market_ctx.vix_spike,
+            "vix_tier": market_ctx.vix_tier,
+            "spy_trend": market_ctx.spy_trend,
+            "spy_return_5d": market_ctx.spy_return_5d,
+            "spy_return_20d": market_ctx.spy_return_20d,
+            "breadth_score": market_ctx.breadth_score,
+            "sector_leaders": market_ctx.sector_leaders,
+            "sector_laggards": market_ctx.sector_laggards,
+            "notes": market_ctx.notes,
+        },
+        "all_recommendations": [],
+    }
+
+
 # ─── Trade Construction Dispatch ─────────────────────────────────────────────
 
 def _construct_trade(rec, ticker, price, chain):
@@ -292,7 +433,8 @@ def _construct_trade(rec, ticker, price, chain):
     return None
 
 
-def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, price):
+def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, price,
+                      market_ctx=None, beta_map=None):
     """Convert trade object + recommendation into a signal dict."""
     regime = regime_map[ticker]
     iv = iv_map[ticker]
@@ -304,6 +446,20 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
     for k, v in list(trade_data.items()):
         if hasattr(v, "__dict__"):
             trade_data[k] = vars(v)
+
+    # Market snapshot for ML features / audit trail
+    market_snapshot: dict = {}
+    if market_ctx is not None:
+        market_snapshot = {
+            "vix": market_ctx.vix_level,
+            "vix_tier": market_ctx.vix_tier,
+            "vix_spike": market_ctx.vix_spike,
+            "spy_5d_return": market_ctx.spy_return_5d,
+            "breadth": market_ctx.breadth_score,
+            "market_regime": market_ctx.market_regime,
+        }
+
+    beta = (beta_map or {}).get(ticker, 1.0)
 
     return {
         "recommendation": {
@@ -319,7 +475,9 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
         "trade": trade_data,
         "context": {
             "price": round(price, 2),
+            "beta": beta,
             "sector": get_sector(ticker),
+            "market_snapshot": market_snapshot,
             "regime_detail": {
                 "adx": regime.adx,
                 "rsi": regime.rsi,
@@ -332,8 +490,8 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "atr": regime.atr,
                 "atr_pct": regime.atr_pct,
                 "volume_trend": regime.volume_trend,
-                "roc_3d": regime.roc_3d,          # V2: short-term 3-day momentum (%)
-                "atr_move_5d": regime.atr_move_5d, # V2: 5-day move in ATR units
+                "roc_3d": regime.roc_3d,
+                "atr_move_5d": regime.atr_move_5d,
             },
             "iv_detail": {
                 "iv_rank": iv.iv_rank,
@@ -343,8 +501,8 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "iv_hv_ratio": iv.iv_hv_ratio,
                 "iv_trend": iv.iv_trend,
                 "premium_action": iv.premium_action,
-                "iv_rv_spread": iv.iv_rv_spread,   # V2: IV minus realized vol (vol pts)
-                "premium_rich": iv.premium_rich,   # V2: True only when real IV > HV+5
+                "iv_rv_spread": iv.iv_rv_spread,
+                "premium_rich": iv.premium_rich,
             },
             "rs_detail": {
                 "rs_vs_spy": rs.rs_vs_spy if rs else None,
@@ -355,10 +513,24 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
     }
 
 
-def _build_trade_stub(rec, df, regime_map, iv_map, rs_map):
+def _build_trade_stub(rec, df, regime_map, iv_map, rs_map,
+                      market_ctx=None, beta_map=None):
     """Build a placeholder trade dict for dry_run mode."""
     ticker = rec.ticker
     price = float(df["close"].iloc[-1]) if not df.empty else 0
+
+    market_snapshot: dict = {}
+    if market_ctx is not None:
+        market_snapshot = {
+            "vix": market_ctx.vix_level,
+            "vix_tier": market_ctx.vix_tier,
+            "vix_spike": market_ctx.vix_spike,
+            "spy_5d_return": market_ctx.spy_return_5d,
+            "breadth": market_ctx.breadth_score,
+            "market_regime": market_ctx.market_regime,
+        }
+
+    beta = (beta_map or {}).get(ticker, 1.0)
 
     return {
         "recommendation": {
@@ -374,7 +546,9 @@ def _build_trade_stub(rec, df, regime_map, iv_map, rs_map):
         "trade": {"dry_run": True, "price": price},
         "context": {
             "price": round(price, 2),
+            "beta": beta,
             "sector": get_sector(ticker),
+            "market_snapshot": market_snapshot,
             "regime_detail": vars(regime_map[ticker]) if ticker in regime_map else {},
             "iv_detail": vars(iv_map[ticker]) if ticker in iv_map else {},
             "rs_detail": {},

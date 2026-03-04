@@ -22,7 +22,10 @@ from typing import Optional
 
 import yfinance as yf
 
-from config.settings import PROFIT_TARGET_PCT, STOP_LOSS_PCT, SIGNALS_DIR
+from config.settings import (
+    PROFIT_TARGET_PCT, STOP_LOSS_PCT, SIGNALS_DIR,
+    VIX_DEFENSIVE_LEVEL, VIX_SPIKE_WINDOW, VIX_SPIKE_THRESHOLD_PCT,
+)
 from src.risk.portfolio import load_positions, close_position, OpenPosition
 from src.pipeline.outcome_tracker import record_exit
 
@@ -67,6 +70,12 @@ def monitor_positions(
     logger.info(f"Monitoring {len(positions)} open positions")
     alerts = []
     today = date.today()
+
+    # ── VIX Spike Pre-Check ───────────────────────────────────────────────────
+    # Pull current VIX before checking individual positions.  If VIX is at
+    # DEFENSIVE level or above, flag all open credit spreads for review.
+    _vix_spike_alerts = _check_vix_spike_for_positions(positions)
+    alerts.extend(_vix_spike_alerts)
 
     for pos in positions:
         try:
@@ -181,6 +190,73 @@ def _check_position(
             )
 
     return None
+
+
+def _check_vix_spike_for_positions(positions) -> list[MonitorAlert]:
+    """
+    Pull current VIX; generate VIX_SPIKE alerts for open credit spreads when:
+    (a) VIX ≥ VIX_DEFENSIVE_LEVEL, or
+    (b) VIX spiked > VIX_SPIKE_THRESHOLD_PCT above its recent rolling average.
+    """
+    alerts: list[MonitorAlert] = []
+    try:
+        vix_hist = yf.Ticker("^VIX").history(period="15d")
+        if vix_hist.empty or len(vix_hist) < 2:
+            return alerts
+        vix_now = round(float(vix_hist["Close"].iloc[-1]), 1)
+        window = min(VIX_SPIKE_WINDOW, len(vix_hist))
+        vix_5d = round(float(vix_hist["Close"].tail(window).mean()), 1)
+    except Exception as exc:
+        logger.warning(f"VIX fetch for spike check failed: {exc}")
+        return alerts
+
+    spike_pct = (vix_now - vix_5d) / vix_5d * 100 if vix_5d > 0 else 0
+    is_spike = spike_pct > VIX_SPIKE_THRESHOLD_PCT
+    is_defensive = vix_now >= VIX_DEFENSIVE_LEVEL
+
+    if not is_defensive and not is_spike:
+        return alerts  # nothing to flag
+
+    spike_note = f" (spike +{spike_pct:.0f}% vs 5d avg)" if is_spike else ""
+    logger.warning(
+        f"VIX DEFENSIVE/SPIKE: {vix_now:.1f}{spike_note} — "
+        "reviewing all credit spread positions"
+    )
+
+    today = date.today()
+    credit_strategies = {
+        "BULL_PUT_SPREAD", "BULL_PUT",
+        "BEAR_CALL_SPREAD", "BEAR_CALL",
+        "IRON_CONDOR",
+    }
+    for pos in positions:
+        if pos.strategy.upper() not in credit_strategies:
+            continue
+        try:
+            exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d").date()
+            dte = (exp_date - today).days
+        except Exception:
+            dte = 0
+        if dte > 0:
+            alerts.append(MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
+                ticker=pos.ticker,
+                strategy=pos.strategy,
+                alert_type="VIX_SPIKE",
+                message=(
+                    f"VIX at {vix_now:.0f}{spike_note} "
+                    f"(≥ DEFENSIVE level if applicable). "
+                    f"{dte} DTE remaining. "
+                    "Review: consider closing losing credit spreads."
+                ),
+                action="REVIEW",
+                priority=1,
+            ))
+    if alerts:
+        logger.warning(
+            f"VIX alert: generated {len(alerts)} VIX_SPIKE alert(s)"
+        )
+    return alerts
 
 
 def _estimate_credit_spread_value(
