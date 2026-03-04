@@ -74,12 +74,6 @@ class TradeOutcome:
     days_held: int = 0
     close_reason: str = ""        # 50% profit, stop loss, expiry, etc.
 
-    # ── V2: Market context at entry (for ML feature set) ─────────────────────
-    entry_vix: float = 0.0        # VIX level when trade was entered
-    entry_vix_tier: str = ""      # NORMAL / CAUTION / DEFENSIVE / LIQUIDATION
-    entry_spy_5d: float = 0.0     # SPY 5-day return at entry (%)
-    entry_roc_3d: float = 0.0     # Stock 3-day ROC at entry (%) — momentum context
-
 
 def record_entry(
     ticker: str,

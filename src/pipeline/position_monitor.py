@@ -125,8 +125,8 @@ def _check_position(
                 action="REVIEW",
                 priority=2,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Expiry parse error for {pos.ticker}: {exc}")
 
     # ── Price-based P&L Check ──────────────────────────────────────────────────
     # Get current stock price to estimate spread value

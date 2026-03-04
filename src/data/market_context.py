@@ -220,8 +220,8 @@ def get_market_context(
                 total_counted += 1
                 if close.iloc[-1] > ema50:
                     above_ema50 += 1
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Breadth calculation error: {exc}")
 
     breadth = round(above_ema50 / max(total_counted, 1), 3)
     adv_decline = round(breadth / (1 - breadth + 0.001), 2) if breadth < 1 else 10.0
