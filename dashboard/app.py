@@ -221,6 +221,47 @@ def page_todays_picks():
                 if rs.get("rs_rank") is not None:
                     st.write(f"RS Rank: {rs.get('rs_rank', 0):.0f}th pctile ({rs.get('rs_trend', '?')})")
 
+            # ── IBKR Real-time Data (if available) ───────────────────────
+            flow = ctx.get("options_flow", {})
+            flow_score = flow.get("flow_score", 0)
+            if flow_score > 0 or flow.get("volume_pace", 0) > 0:
+                st.markdown("**📡 IBKR Live Data**")
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                fc1.metric(
+                    "Flow Score",
+                    f"{flow_score:.0f}/100",
+                    help="0=normal, 100=extreme unusual options activity",
+                )
+                dominant = flow.get("dominant_side", "NEUTRAL")
+                fc2.metric(
+                    "Dominant Flow",
+                    dominant,
+                    delta="↑ aligned" if (
+                        (dominant == "CALLS" and direction == "BULLISH") or
+                        (dominant == "PUTS" and direction == "BEARISH")
+                    ) else ("↓ counter" if dominant != "NEUTRAL" else None),
+                    delta_color="normal" if (
+                        (dominant == "CALLS" and direction == "BULLISH") or
+                        (dominant == "PUTS" and direction == "BEARISH")
+                    ) else "inverse",
+                )
+                fc3.metric(
+                    "Vol Pace",
+                    f"{flow.get('volume_pace', 1.0):.1f}x",
+                    help="Today's volume vs 20-day average",
+                )
+                live_iv = flow.get("live_iv")
+                fc4.metric(
+                    "Live IV",
+                    f"{live_iv:.1f}%" if live_iv else "N/A",
+                    help="Real-time ATM implied volatility from IBKR",
+                )
+                if flow.get("put_call_volume_ratio"):
+                    st.caption(
+                        f"Put/Call Vol Ratio: {flow.get('put_call_volume_ratio', 1.0):.2f} | "
+                        f"Source: IBKR real-time"
+                    )
+
             st.caption(f"Rationale: {rec.get('rationale', '')}")
             st.caption(f"Composite score: {p.get('composite_score', 0):.4f}")
 

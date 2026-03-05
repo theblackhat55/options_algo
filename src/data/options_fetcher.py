@@ -26,12 +26,52 @@ import requests
 from config.settings import (
     POLYGON_API_KEY, TRADIER_API_KEY, RAW_DIR, PROCESSED_DIR,
     MIN_OPTION_VOLUME, MIN_OPEN_INTEREST, MAX_BID_ASK_SPREAD_PCT,
+    IBKR_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
 
 POLYGON_BASE = "https://api.polygon.io"
 TRADIER_BASE = "https://api.tradier.com/v1"
+
+
+# ─── IBKR Source ──────────────────────────────────────────────────────────────
+
+def _fetch_ibkr(
+    ticker: str,
+    dte_min: int = 7,
+    dte_max: int = 60,
+) -> pd.DataFrame:
+    """
+    Fetch options chain from IBKR via ibkr_client.
+
+    Opens a dedicated connection for this ticker (suitable for ad-hoc calls).
+    For bulk scans, prefer passing a shared IB connection directly to
+    ibkr_client.fetch_options_chain_ibkr() to avoid per-ticker connect overhead.
+
+    Returns:
+        DataFrame with the standard options schema, or empty DataFrame on any error.
+    """
+    try:
+        from config.settings import IBKR_CLIENT_ID_OPTIONS
+        from src.data.ibkr_client import (
+            connect_ibkr,
+            disconnect_ibkr,
+            fetch_options_chain_ibkr,
+        )
+        # Use an alternate client ID so this helper can run even if another
+        # IB connection (clientId=IBKR_CLIENT_ID_OPTIONS) is already active.
+        ad_hoc_client_id = IBKR_CLIENT_ID_OPTIONS + 1000
+        ib = connect_ibkr(client_id=ad_hoc_client_id)
+        if ib is None:
+            return pd.DataFrame()
+        try:
+            return fetch_options_chain_ibkr(ib, ticker, dte_min=dte_min, dte_max=dte_max)
+        finally:
+            disconnect_ibkr(ib)
+    except Exception as exc:
+        logger.warning(f"{ticker}: _fetch_ibkr error: {exc}")
+        return pd.DataFrame()
 
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -44,7 +84,8 @@ def fetch_options_chain(
     dte_max: int = 60,
 ) -> pd.DataFrame:
     """
-    Fetch options chain, trying sources in order: Polygon → Tradier → yfinance.
+    Fetch options chain, trying sources in order:
+        IBKR (real Greeks, live bid/ask) → Polygon → Tradier → yfinance.
 
     Returns DataFrame with columns:
         ticker, contract_ticker, expiration, strike, type,
@@ -57,6 +98,13 @@ def fetch_options_chain(
         expiration_gte = (today + timedelta(days=dte_min)).isoformat()
     if expiration_lte is None:
         expiration_lte = (today + timedelta(days=dte_max)).isoformat()
+
+    # Try IBKR first (real Greeks, tight bid/ask)
+    if IBKR_ENABLED:
+        df = _fetch_ibkr(ticker, dte_min=dte_min, dte_max=dte_max)
+        if not df.empty:
+            logger.info(f"{ticker}: using IBKR options data ({len(df)} contracts)")
+            return df
 
     # Try Polygon first
     if POLYGON_API_KEY:

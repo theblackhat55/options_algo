@@ -32,6 +32,9 @@ NUMERIC_FEATURES = [
     "iv_rank", "iv_hv_ratio", "adx", "rsi", "trend_strength",
     "direction_score", "rs_rank", "dte_at_entry", "spread_width",
     "short_delta", "prob_profit", "confidence",
+    # IBKR real-time features at entry (nullable — filled with median)
+    "options_flow_score", "put_call_volume_ratio", "volume_pace",
+    "live_iv_at_entry", "iv_skew_at_entry",
 ]
 
 CATEGORICAL_FEATURES = [
