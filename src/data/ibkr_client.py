@@ -108,6 +108,16 @@ def connect_ibkr(
         logger.warning("ib_insync not available — skipping IBKR connection")
         return None
 
+    # Honour IBKR_ENABLED flag — allows callers to disable IBKR without
+    # uninstalling ib_insync (e.g. IBKR_ENABLED=false in .env).
+    try:
+        from config.settings import IBKR_ENABLED as _IBKR_ENABLED
+        if not _IBKR_ENABLED:
+            logger.debug("IBKR_ENABLED=false — skipping connection")
+            return None
+    except Exception:
+        pass  # settings import failed; attempt connection anyway
+
     # Pull defaults from settings only when needed (avoids circular import)
     if host is None or port is None or client_id is None or timeout is None:
         try:
@@ -386,7 +396,7 @@ def fetch_options_chain_ibkr(
 
         # ── Step 7: collect results ───────────────────────────────────────────
         rows: list[dict] = []
-        meta_by_contract = {id(oc[0]): oc for oc in option_contracts}
+        # meta_by_contract removed — was dead code; metadata looked up inline below.
 
         for t, opt_contract in tickers_list:
             # Find matching metadata

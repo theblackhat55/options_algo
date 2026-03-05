@@ -224,7 +224,7 @@ def page_todays_picks():
             # ── IBKR Real-time Data (if available) ───────────────────────
             flow = ctx.get("options_flow", {})
             flow_score = flow.get("flow_score", 0)
-            if flow_score > 0 or flow.get("volume_pace", 0) > 0:
+            if flow_score > 0 or flow.get("live_iv") is not None:
                 st.markdown("**📡 IBKR Live Data**")
                 fc1, fc2, fc3, fc4 = st.columns(4)
                 fc1.metric(

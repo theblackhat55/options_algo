@@ -38,7 +38,7 @@ from config.settings import (
     SIGNALS_DIR, MAX_POSITIONS,
     MIN_STOCK_PRICE, MIN_AVG_VOLUME, LOG_LEVEL,
     VIX_CAUTION_LEVEL, VIX_DEFENSIVE_LEVEL, VIX_LIQUIDATION_LEVEL,
-    MAX_PER_SECTOR, SPY_DIRECTIONAL_GATE_PCT,
+    MAX_PER_SECTOR, SPY_DIRECTIONAL_GATE_PCT, IBKR_ENABLED,
 )
 from config.universe import get_universe, get_sector, get_tradeable_universe
 
@@ -183,7 +183,7 @@ def run_nightly_scan(
     # ── Step 6b: IBKR Real-time Enrichment ───────────────────────────────────
     logger.info("Step 6b: IBKR real-time enrichment (options flow, live IV)")
     rt_enrichment: dict[str, dict] = {}
-    if not dry_run:
+    if not dry_run and IBKR_ENABLED:
         try:
             from src.data.ibkr_client import connect_ibkr, disconnect_ibkr
             from src.data.ibkr_realtime import fetch_realtime_enrichment
