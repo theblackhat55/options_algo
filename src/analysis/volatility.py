@@ -133,6 +133,10 @@ def _load_iv_snapshot_history(
 
     # Fallback: HV × 1.15 proxy
     iv_proxy = compute_historical_volatility(close_series, window=30) * 100 * 1.15
+    logger.debug(
+        f"{ticker}: IV proxy (HV×1.15) — "
+        f"snapshot has fewer than {IV_SNAPSHOT_MIN_HISTORY} days of real data"
+    )
     return iv_proxy, True
 
 
@@ -183,6 +187,7 @@ def analyze_iv(
         else:
             current_iv_raw = (hv_20 / 100) * 1.15    # IV proxy — no options chain
             iv_is_proxy = True
+            logger.debug(f"{ticker}: spot IV proxy — no options chain provided")
 
         current_iv = current_iv_raw * 100   # Already % if from get_atm_iv
 

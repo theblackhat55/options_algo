@@ -133,7 +133,10 @@ class TestPatternSignalsDataclass:
 
     def test_fields_all_present(self):
         fields = [
-            "ticker", "bullish_divergence", "bearish_divergence", "divergence_strength",
+            "ticker", "bullish_divergence", "bearish_divergence",
+            "divergence_strength",               # backwards-compat
+            "bullish_divergence_strength",        # V3: per-direction
+            "bearish_divergence_strength",        # V3: per-direction
             "inside_bar", "volume_climax", "climax_direction",
             "squeeze_fired", "squeeze_direction",
             "above_anchored_vwap", "below_anchored_vwap", "pattern_score",
@@ -241,6 +244,8 @@ class TestDetectDivergence:
         rsi   = list(range(50, 70))
         signals = self._run_divergence(close, rsi)
         assert signals.divergence_strength == 0.0
+        assert signals.bullish_divergence_strength == 0.0
+        assert signals.bearish_divergence_strength == 0.0
 
     def test_insufficient_data_no_crash(self):
         """Very short series should not raise — silently skip."""
