@@ -82,6 +82,14 @@ class TradeOutcome:
     live_iv_at_entry: float = 0.0      # real-time ATM IV at entry (%)
     iv_skew_at_entry: float = 0.0      # put IV - call IV at entry
 
+    # ── V3: Long Option Fields ────────────────────────────────────────────────
+    is_long_option: bool = False       # True for LONG_CALL / LONG_PUT trades
+    entry_theta_rate: float = 0.0      # |theta| / premium at entry (daily decay %)
+    entry_iv_rank: float = 0.0         # IV rank at entry (0-100)
+    ta_pattern_score: float = 0.0      # Composite TA pattern score at entry (-1 to +1)
+    ta_breakout: bool = False          # Price broke resistance on volume at entry
+    ta_divergence: bool = False        # RSI divergence detected at entry
+
 
 def record_entry(
     ticker: str,
@@ -155,6 +163,16 @@ def record_entry(
         volume_pace=float(flow.get("volume_pace", 1.0)),
         live_iv_at_entry=float(flow.get("live_iv") or 0.0),
         iv_skew_at_entry=float(iv.get("skew", 0.0)),
+        # V3: Long option fields
+        is_long_option=bool(context.get("is_long_option", False)),
+        entry_theta_rate=float(trade.get("theta_rate", 0.0)),
+        entry_iv_rank=float(iv.get("iv_rank", 0.0)),
+        ta_pattern_score=float((context.get("ta_signals") or {}).get("pattern_score", 0.0)),
+        ta_breakout=bool((context.get("ta_signals") or {}).get("breakout_above", False)),
+        ta_divergence=bool(
+            (context.get("ta_signals") or {}).get("bullish_divergence", False) or
+            (context.get("ta_signals") or {}).get("bearish_divergence", False)
+        ),
     )
 
     _append_outcome(outcome)
@@ -180,7 +198,10 @@ def record_exit(
             ).days
 
             # P&L calculation
-            if out.net_credit_or_debit > 0:
+            if getattr(out, "is_long_option", False):
+                # Long option: cost was |net_credit_or_debit|, exit at current premium
+                out.pnl = round(exit_price - abs(out.net_credit_or_debit), 2)
+            elif out.net_credit_or_debit > 0:
                 # Credit spread: profit = credit − exit_price
                 out.pnl = round((out.net_credit_or_debit - exit_price), 2)
             else:

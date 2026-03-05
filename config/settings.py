@@ -141,3 +141,57 @@ IBKR_CLIENT_ID_OPTIONS = int(os.getenv("IBKR_CLIENT_ID_OPTIONS", "11"))
 IBKR_ENABLED = os.getenv("IBKR_ENABLED", "true").lower() == "true"
 IBKR_TIMEOUT = int(os.getenv("IBKR_TIMEOUT", "10"))
 IBKR_MAX_CONTRACTS_PER_TICKER = int(os.getenv("IBKR_MAX_CONTRACTS_PER_TICKER", "50"))
+
+# ─── Long Option Parameters (V3) ─────────────────────────────────────────────
+# DTE for long calls/puts — enough time for the move, limits theta burn
+DEFAULT_DTE_LONG_OPTION = int(os.getenv("DEFAULT_DTE_LONG_OPTION", "35"))
+
+# Delta target for long call/put selection (0.60-0.70 = slightly ITM for higher prob)
+LONG_OPTION_DELTA = float(os.getenv("LONG_OPTION_DELTA", "0.65"))
+
+# Minimum confidence required to recommend a naked long option (higher bar than spreads)
+LONG_OPTION_MIN_CONFIDENCE = float(os.getenv("LONG_OPTION_MIN_CONFIDENCE", "0.65"))
+
+# Profit target for long options: close at 100% gain (option doubled)
+LONG_OPTION_PROFIT_TARGET_PCT = float(os.getenv("LONG_OPTION_PROFIT_TARGET_PCT", "100"))
+
+# Stop loss for long options: close at 50% loss of premium paid
+LONG_OPTION_STOP_LOSS_PCT = float(os.getenv("LONG_OPTION_STOP_LOSS_PCT", "50"))
+
+# Time stop: close position if DTE falls below this regardless of P/L
+LONG_OPTION_TIME_STOP_DTE = int(os.getenv("LONG_OPTION_TIME_STOP_DTE", "10"))
+
+# Maximum theta decay rate: daily_theta / premium must be < this value
+LONG_OPTION_MAX_THETA_RATE = float(os.getenv("LONG_OPTION_MAX_THETA_RATE", "0.03"))
+
+# Maximum % of total capital allocated to long options across all positions
+LONG_OPTION_MAX_ALLOCATION_PCT = float(os.getenv("LONG_OPTION_MAX_ALLOCATION_PCT", "30"))
+
+# IV Rank ceiling — never buy premium when IV rank is above this
+LONG_OPTION_IV_RANK_CEILING = float(os.getenv("LONG_OPTION_IV_RANK_CEILING", "40"))
+
+# ─── Technical Analysis Parameters (V3) ──────────────────────────────────────
+# Support/Resistance: lookback period for volume-profile pivot detection
+SR_LOOKBACK_DAYS = int(os.getenv("SR_LOOKBACK_DAYS", "60"))
+
+# Number of price bins for volume profile clustering
+SR_VOLUME_BINS = int(os.getenv("SR_VOLUME_BINS", "50"))
+
+# Proximity threshold: price within this % of S/R is "near" a level
+SR_PROXIMITY_PCT = float(os.getenv("SR_PROXIMITY_PCT", "1.5"))
+
+# Volume confirmation: breakout requires volume > this multiple of 20d avg
+BREAKOUT_VOLUME_MULTIPLIER = float(os.getenv("BREAKOUT_VOLUME_MULTIPLIER", "1.5"))
+
+# RSI divergence: minimum number of bars to look back for swing detection
+DIVERGENCE_LOOKBACK = int(os.getenv("DIVERGENCE_LOOKBACK", "14"))
+
+# Volume climax: volume > this multiple of 20d avg = climax event
+VOLUME_CLIMAX_MULTIPLIER = float(os.getenv("VOLUME_CLIMAX_MULTIPLIER", "3.0"))
+
+# ─── Polygon IV Snapshot Store (V3) ──────────────────────────────────────────
+IV_SNAPSHOT_DIR = PROCESSED_DIR / "iv_snapshots"
+IV_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Minimum days of IV snapshot history before using real data over proxy
+IV_SNAPSHOT_MIN_HISTORY = int(os.getenv("IV_SNAPSHOT_MIN_HISTORY", "20"))

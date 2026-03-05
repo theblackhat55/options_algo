@@ -88,6 +88,15 @@ class StockRegime:
     roc_3d: float = 0.0        # NEW: 3-day rate of change (%)
     atr_move_5d: float = 0.0   # NEW: 5-day price move expressed in ATR units
 
+    # ── V3: Enhanced TA signals ──────────────────────────────────────────────
+    ta_signals: dict = field(default_factory=dict)
+    # Keys populated by nightly_scan after calling analyze_levels() + detect_patterns():
+    # breakout_above, breakdown_below, near_support, near_resistance,
+    # bullish_divergence, bearish_divergence, divergence_strength,
+    # squeeze_fired, squeeze_direction, volume_climax, climax_direction,
+    # inside_bar, above_anchored_vwap, below_anchored_vwap,
+    # pattern_score, support_distance_pct, resistance_distance_pct
+
 
 # ─── Main Classification Function ────────────────────────────────────────────
 

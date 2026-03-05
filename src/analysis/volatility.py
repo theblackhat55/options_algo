@@ -26,7 +26,7 @@ import pandas as pd
 
 from config.settings import (
     IV_LOOKBACK_DAYS, HV_WINDOW, IV_HIGH_THRESHOLD, IV_LOW_THRESHOLD,
-    MIN_IV_RV_SPREAD_CREDIT,
+    MIN_IV_RV_SPREAD_CREDIT, IV_SNAPSHOT_DIR, IV_SNAPSHOT_MIN_HISTORY,
 )
 from src.data.options_fetcher import get_atm_iv
 
@@ -99,6 +99,43 @@ def compute_iv_percentile(iv_series: pd.Series, lookback: int = 252) -> float:
     return round(pct, 1)
 
 
+# ─── IV Snapshot History Loader ───────────────────────────────────────────────
+
+def _load_iv_snapshot_history(
+    ticker: str,
+    close_series: pd.Series,
+) -> tuple[pd.Series, bool]:
+    """
+    Try to load real IV history from Parquet snapshots captured by
+    scripts/capture_iv_snapshot.py. Falls back to HV×1.15 proxy if
+    fewer than IV_SNAPSHOT_MIN_HISTORY days are available.
+
+    Returns:
+        (iv_series, is_proxy) — series aligned to close_series index
+    """
+    import pathlib
+
+    snapshot_path = pathlib.Path(IV_SNAPSHOT_DIR) / f"{ticker}_iv_history.parquet"
+    try:
+        if snapshot_path.exists():
+            snap_df = pd.read_parquet(snapshot_path)
+            # Expect columns: date (index), atm_iv (float, already in %)
+            if "atm_iv" in snap_df.columns and len(snap_df) >= IV_SNAPSHOT_MIN_HISTORY:
+                snap_df.index = pd.to_datetime(snap_df.index)
+                iv_series = snap_df["atm_iv"].dropna()
+                if len(iv_series) >= IV_SNAPSHOT_MIN_HISTORY:
+                    logger.debug(
+                        f"{ticker}: using real IV snapshot ({len(iv_series)} days)"
+                    )
+                    return iv_series, False
+    except Exception as exc:
+        logger.debug(f"{ticker}: IV snapshot load failed — {exc}")
+
+    # Fallback: HV × 1.15 proxy
+    iv_proxy = compute_historical_volatility(close_series, window=30) * 100 * 1.15
+    return iv_proxy, True
+
+
 # ─── Main Analysis Function ───────────────────────────────────────────────────
 
 def analyze_iv(
@@ -153,21 +190,24 @@ def analyze_iv(
         if current_iv < 1.0:
             current_iv *= 100
 
-        # Build IV history from 30-day HV as proxy
-        # (Real IV history requires Polygon Premium; this is the free-tier proxy)
-        iv_proxy_series = compute_historical_volatility(close, window=30) * 100
-        # Inflate HV proxy to approximate IV levels
-        iv_proxy_series = iv_proxy_series * 1.15
+        # ── IV History: prefer real snapshot, fallback to HV×1.15 proxy ───────
+        iv_history_series, iv_is_proxy = _load_iv_snapshot_history(
+            ticker, close
+        )
+        # Recheck proxy flag: if we got real snapshot data, iv_is_proxy stays False
+        # only if the snapshot was used AND the spot current_iv was from options chain
+        if iv_is_proxy and not iv_is_proxy:
+            iv_is_proxy = True   # keep existing proxy flag from spot IV logic above
 
         # ── IV Rank / Percentile ──────────────────────────────────────────────
-        iv_rank = compute_iv_rank(iv_proxy_series, IV_LOOKBACK_DAYS)
-        iv_pctile = compute_iv_percentile(iv_proxy_series, IV_LOOKBACK_DAYS)
+        iv_rank = compute_iv_rank(iv_history_series, IV_LOOKBACK_DAYS)
+        iv_pctile = compute_iv_percentile(iv_history_series, IV_LOOKBACK_DAYS)
 
         # ── IV/HV Ratio ───────────────────────────────────────────────────────
         iv_hv_ratio = round(current_iv / hv_20, 2) if hv_20 > 0 else 1.0
 
         # ── 30-Day IV Moving Average ──────────────────────────────────────────
-        iv_30d_avg = round(float(iv_proxy_series.tail(30).mean()), 1)
+        iv_30d_avg = round(float(iv_history_series.tail(30).mean()), 1)
 
         # ── IV Regime ─────────────────────────────────────────────────────────
         if iv_rank >= IV_HIGH_THRESHOLD:
@@ -181,7 +221,7 @@ def analyze_iv(
             premium_action = "NEUTRAL"
 
         # ── IV Trend ──────────────────────────────────────────────────────────
-        recent_iv = iv_proxy_series.tail(10).dropna()
+        recent_iv = iv_history_series.tail(10).dropna()
         if len(recent_iv) >= 5:
             iv_5d_ago = float(recent_iv.iloc[-5])
             iv_now = float(recent_iv.iloc[-1])
