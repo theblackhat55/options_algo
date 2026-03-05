@@ -65,6 +65,95 @@ from src.risk.event_filter import filter_safe_tickers
 
 logger = logging.getLogger(__name__)
 
+# ── Phase 5: ML Confidence Blending (optional) ────────────────────────────────
+import os
+import pickle
+from pathlib import Path as _Path
+
+_ML_MODEL_PATH = _Path(os.getenv("ML_MODEL_PATH", "models/lgb_win_predictor.pkl"))
+_ML_BLEND_HEURISTIC = float(os.getenv("ML_BLEND_HEURISTIC", "0.60"))  # 60% heuristic
+_ML_BLEND_ML = float(os.getenv("ML_BLEND_ML", "0.40"))                # 40% ML
+_ml_model = None  # lazy-loaded
+
+def _load_ml_model():
+    global _ml_model
+    if _ml_model is not None:
+        return _ml_model
+    if _ML_MODEL_PATH.exists():
+        try:
+            with open(_ML_MODEL_PATH, "rb") as _f:
+                _ml_model = pickle.load(_f)
+            logger.info(f"ML model loaded from {_ML_MODEL_PATH}")
+        except Exception as _exc:
+            logger.warning(f"ML model load failed: {_exc}")
+            _ml_model = None
+    return _ml_model
+
+
+def _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis=None) -> list:
+    """
+    Build a numeric feature vector for the ML win predictor.
+    Must match the feature order used when the model was trained
+    (see src/models/features.py NUMERIC_FEATURES + BINARY_FEATURES).
+    """
+    rs_rank = rs_analysis.rank if rs_analysis and hasattr(rs_analysis, "rank") else 50.0
+    ta_sigs = getattr(regime, "ta_signals", {}) or {}
+    return [
+        # numeric
+        iv_analysis.iv_rank if iv_analysis else 50.0,
+        iv_analysis.iv_hv_ratio if iv_analysis else 1.0,
+        regime.adx,
+        regime.rsi,
+        regime.trend_strength,
+        regime.direction_score,
+        float(rs_rank),
+        float(rec.target_dte),
+        0.0,   # spread_width (N/A for long option)
+        0.0,   # short_delta
+        float(rec.confidence * 100),  # prob_profit proxy
+        rec.confidence,
+        0.0,   # options_flow_score
+        1.0,   # put_call_volume_ratio
+        1.0,   # volume_pace
+        0.0,   # live_iv_at_entry
+        0.0,   # iv_skew_at_entry
+        ta_sigs.get("pattern_score", ta_sigs.get("ta_pattern_score", 0.0)) or 0.0,
+        0.0,   # entry_theta_rate
+        iv_analysis.iv_rank if iv_analysis else 50.0,  # entry_iv_rank
+        # binary
+        float(ta_sigs.get("breakout_above", False)),
+        float(ta_sigs.get("bullish_divergence", False) or ta_sigs.get("bearish_divergence", False)),
+        float(rec.strategy.value in ("LONG_CALL", "LONG_PUT")),
+    ]
+
+
+def _apply_ml_confidence(rec, regime, iv_analysis, rs_analysis=None) -> None:
+    """
+    If lgb_win_predictor.pkl exists, blend ML prediction with heuristic confidence.
+    rec.confidence = 0.60 × heuristic + 0.40 × ML_probability
+    """
+    model = _load_ml_model()
+    if model is None:
+        return  # no model → use heuristic confidence as-is
+
+    try:
+        fv = _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis)
+        import numpy as np
+        X = np.array([fv], dtype=float)
+        ml_prob = float(model.predict_proba(X)[0][1])  # prob of win
+        heuristic = rec.confidence
+        blended = _ML_BLEND_HEURISTIC * heuristic + _ML_BLEND_ML * ml_prob
+        blended = round(min(max(blended, 0.01), 0.99), 4)
+        logger.debug(
+            f"ML blend {rec.ticker}: heuristic={heuristic:.3f} ml={ml_prob:.3f} "
+            f"→ blended={blended:.3f}"
+        )
+        rec.confidence = blended
+    except Exception as exc:
+        logger.debug(f"ML confidence blend failed for {rec.ticker}: {exc}")
+
+
+
 
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
 

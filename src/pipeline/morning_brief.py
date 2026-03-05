@@ -247,6 +247,37 @@ def format_morning_brief(signal: dict = None) -> str:
         if not trade.get("dry_run"):
             lines.append(_format_trade(trade, rec.get("strategy", "")))
 
+            # TA-signal one-liner
+            ta_sigs = rec.get("ta_signals") or {}
+            ta_parts = []
+            if ta_sigs.get("breakout_above"):
+                ta_parts.append("⬆ breakout")
+            if ta_sigs.get("breakdown_below"):
+                ta_parts.append("⬇ breakdown")
+            if ta_sigs.get("bullish_divergence"):
+                ta_parts.append("↗ bull-div")
+            if ta_sigs.get("bearish_divergence"):
+                ta_parts.append("↘ bear-div")
+            if ta_sigs.get("squeeze_direction") == "up":
+                ta_parts.append("⚡ squeeze-up")
+            elif ta_sigs.get("squeeze_direction") == "down":
+                ta_parts.append("⚡ squeeze-dn")
+            if ta_parts:
+                lines.append(f"TA:       {' | '.join(ta_parts)}")
+
+            # Long-option flag line
+            if rec.get("is_long_option") or rec.get("strategy") in ("LONG_CALL", "LONG_PUT"):
+                from config.settings import (
+                    LONG_OPTION_PROFIT_TARGET_PCT,
+                    LONG_OPTION_STOP_LOSS_PCT,
+                    LONG_OPTION_TIME_STOP_DTE,
+                )
+                lines.append(
+                    f"Long Opt: profit-target +{LONG_OPTION_PROFIT_TARGET_PCT:.0f}% | "
+                    f"stop-loss -{LONG_OPTION_STOP_LOSS_PCT:.0f}% | "
+                    f"time-stop ≤{LONG_OPTION_TIME_STOP_DTE}DTE"
+                )
+
         lines.append(f"Rationale: {rationale}")
         lines.append(SEPARATOR)
 
@@ -319,6 +350,24 @@ def _format_trade(trade: dict, strategy_name: str) -> str:
             f"Credit ${trade.get('total_credit', 0):.2f} | "
             f"Zone {trade.get('put_breakeven', 0):.1f}-{trade.get('call_breakeven', 0):.1f} | "
             f"PoP {trade.get('prob_profit', 0):.0f}%"
+        )
+    elif spread_type in ("LONG_CALL",) or "LONG_CALL" in strategy_name.upper():
+        return (
+            f"Trade:    Buy {trade.get('strike', trade.get('short_strike', 0)):.1f} Call "
+            f"({trade.get('expiration', '?')}, {trade.get('dte', 0)}d) | "
+            f"Debit ${trade.get('premium', trade.get('net_debit', 0)):.2f} | "
+            f"Breakeven ${trade.get('breakeven', 0):.2f} | "
+            f"PoP {trade.get('prob_profit', 0):.0f}% | "
+            f"EV ${trade.get('ev', 0):.2f}"
+        )
+    elif spread_type in ("LONG_PUT",) or "LONG_PUT" in strategy_name.upper():
+        return (
+            f"Trade:    Buy {trade.get('strike', trade.get('short_strike', 0)):.1f} Put "
+            f"({trade.get('expiration', '?')}, {trade.get('dte', 0)}d) | "
+            f"Debit ${trade.get('premium', trade.get('net_debit', 0)):.2f} | "
+            f"Breakeven ${trade.get('breakeven', 0):.2f} | "
+            f"PoP {trade.get('prob_profit', 0):.0f}% | "
+            f"EV ${trade.get('ev', 0):.2f}"
         )
     else:
         return f"Trade:    {spread_type} (see signal JSON for details)"

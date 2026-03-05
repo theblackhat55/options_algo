@@ -157,6 +157,57 @@ def render():
     if regime.bb_squeeze:
         st.success("📦 Bollinger Band Squeeze Active — potential breakout incoming")
 
+    # ── TA Signals & Level Analysis ──────────────────────────────────────────
+    try:
+        from src.analysis.levels import analyze_levels
+        from src.analysis.patterns import detect_patterns
+        with st.spinner("Running TA analysis (levels + patterns)..."):
+            levels = analyze_levels(ticker, df)
+            patterns = detect_patterns(ticker, df)
+
+        if levels is not None or patterns is not None:
+            st.markdown("---")
+            st.subheader("🔍 TA Signals & S/R Levels")
+
+        if levels is not None:
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            lc1.metric("Nearest Support", f"${levels.nearest_support:.2f}" if levels.nearest_support else "N/A")
+            lc2.metric("Nearest Resistance", f"${levels.nearest_resistance:.2f}" if levels.nearest_resistance else "N/A")
+            lc3.metric("Dist to Support", f"{levels.distance_to_support_pct:.1f}%" if levels.distance_to_support_pct else "N/A")
+            lc4.metric("Dist to Resistance", f"{levels.distance_to_resistance_pct:.1f}%" if levels.distance_to_resistance_pct else "N/A")
+
+            flag_cols = st.columns(4)
+            flag_cols[0].write(f"{'✅' if levels.near_support else '—'} Near Support")
+            flag_cols[1].write(f"{'✅' if levels.near_resistance else '—'} Near Resistance")
+            flag_cols[2].write(f"{'⬆' if levels.breakout_above else '—'} Breakout Above")
+            flag_cols[3].write(f"{'⬇' if levels.breakdown_below else '—'} Breakdown Below")
+
+            if levels.volume_profile_skew:
+                st.caption(f"Volume profile skew: **{levels.volume_profile_skew}**")
+
+        if patterns is not None:
+            with st.expander("📡 Pattern Signals", expanded=True):
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Pattern Score", f"{patterns.pattern_score:+.2f}")
+                pc2.metric(
+                    "Divergence",
+                    "Bullish" if patterns.bullish_divergence else ("Bearish" if patterns.bearish_divergence else "None")
+                )
+                pc3.metric("Squeeze Fired", patterns.squeeze_direction.upper() if patterns.squeeze_direction else "No")
+
+                pat_flags = st.columns(4)
+                pat_flags[0].write(f"{'✅' if patterns.bullish_divergence else '—'} Bull Divergence")
+                pat_flags[1].write(f"{'✅' if patterns.bearish_divergence else '—'} Bear Divergence")
+                pat_flags[2].write(f"{'✅' if patterns.inside_bar else '—'} Inside Bar")
+                pat_flags[3].write(f"{'✅' if patterns.volume_climax else '—'} Vol Climax ({patterns.climax_direction})")
+
+                vwap_flags = st.columns(2)
+                vwap_flags[0].write(f"{'✅' if patterns.above_anchored_vwap else '—'} Above Anchored VWAP")
+                vwap_flags[1].write(f"{'✅' if patterns.below_anchored_vwap else '—'} Below Anchored VWAP")
+
+    except Exception as exc:
+        st.caption(f"TA analysis unavailable: {exc}")
+
     # ── IV Analysis ──
     with st.spinner("Analyzing volatility..."):
         iv = analyze_iv(ticker, df)

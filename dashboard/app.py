@@ -49,7 +49,7 @@ st.sidebar.title("📊 Options Algo")
 st.sidebar.markdown("---")
 page = st.sidebar.selectbox(
     "Navigation",
-    ["Ticker Analysis", "Today's Picks", "IV Heatmap", "Regime Map", "Trade Log", "Strategy Stats", "Run Scan"],
+    ["Ticker Analysis", "Today's Picks", "Portfolio Overview", "IV Snapshots", "IV Heatmap", "Regime Map", "Trade Log", "Strategy Stats", "Run Scan"],
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Date: {date.today()}")
@@ -261,6 +261,55 @@ def page_todays_picks():
                         f"Put/Call Vol Ratio: {flow.get('put_call_volume_ratio', 1.0):.2f} | "
                         f"Source: IBKR real-time"
                     )
+
+            # ── TA Signals Expander ────────────────────────────────────
+            ta_sigs = ctx.get("ta_signals") or rec.get("ta_signals") or {}
+            if ta_sigs:
+                with st.expander("📡 TA Signals", expanded=False):
+                    ta_items = [
+                        ("Breakout Above", ta_sigs.get("breakout_above", False), "✅", "❌"),
+                        ("Breakdown Below", ta_sigs.get("breakdown_below", False), "✅", "❌"),
+                        ("Bullish Divergence", ta_sigs.get("bullish_divergence", False), "✅", "—"),
+                        ("Bearish Divergence", ta_sigs.get("bearish_divergence", False), "✅", "—"),
+                        ("Near Support", ta_sigs.get("near_support", False), "✅", "—"),
+                        ("Near Resistance", ta_sigs.get("near_resistance", False), "✅", "—"),
+                        ("Above VWAP", ta_sigs.get("above_anchored_vwap", False), "✅", "—"),
+                        ("Below VWAP", ta_sigs.get("below_anchored_vwap", False), "✅", "—"),
+                    ]
+                    squeeze_dir = ta_sigs.get("squeeze_direction", "")
+                    climax_dir = ta_sigs.get("climax_direction", "")
+                    ta_cols = st.columns(2)
+                    for i, (label, val, icon_true, icon_false) in enumerate(ta_items):
+                        ta_cols[i % 2].write(f"{icon_true if val else icon_false} {label}")
+                    if squeeze_dir:
+                        st.write(f"⚡ Squeeze direction: **{squeeze_dir.upper()}**")
+                    if climax_dir:
+                        st.write(f"📊 Volume climax: **{climax_dir.upper()}**")
+                    pat_score = ta_sigs.get("pattern_score", ta_sigs.get("ta_pattern_score", None))
+                    if pat_score is not None:
+                        st.metric("Pattern Score", f"{pat_score:.2f}")
+
+            # ── Long-Option Detail ─────────────────────────────────────────
+            is_long = rec.get("is_long_option") or rec.get("strategy", "") in ("LONG_CALL", "LONG_PUT")
+            if is_long:
+                try:
+                    from config.settings import (
+                        LONG_OPTION_PROFIT_TARGET_PCT,
+                        LONG_OPTION_STOP_LOSS_PCT,
+                        LONG_OPTION_TIME_STOP_DTE,
+                    )
+                    st.info(
+                        f"🎯 **Long Option Rules** — "
+                        f"Profit target: +{LONG_OPTION_PROFIT_TARGET_PCT:.0f}% | "
+                        f"Stop loss: -{LONG_OPTION_STOP_LOSS_PCT:.0f}% | "
+                        f"Time stop: ≤{LONG_OPTION_TIME_STOP_DTE} DTE"
+                    )
+                    theta_rate = trade.get("theta_rate", ctx.get("entry_theta_rate"))
+                    iv_rank_entry = trade.get("iv_rank", iv.get("iv_rank"))
+                    if theta_rate is not None:
+                        st.caption(f"Theta rate: {theta_rate:.3f}/day | IV rank at entry: {iv_rank_entry:.0f}%")
+                except Exception:
+                    pass
 
             st.caption(f"Rationale: {rec.get('rationale', '')}")
             st.caption(f"Composite score: {p.get('composite_score', 0):.4f}")
@@ -594,12 +643,156 @@ openclaw cron add \\
 """, language="bash")
 
 
+
+
+# ─── Page: IV Snapshots ───────────────────────────────────────────────────────
+
+def page_iv_snapshots():
+    st.title("📷 IV Snapshots")
+    st.caption("Daily IV, Greeks, and OI snapshots captured from Polygon/Tradier/yfinance.")
+
+    try:
+        from config.settings import IV_SNAPSHOT_DIR, IV_SNAPSHOT_MIN_HISTORY
+    except ImportError:
+        st.error("IV_SNAPSHOT_DIR not configured. Update config/settings.py.")
+        return
+
+    snap_dir = IV_SNAPSHOT_DIR
+    if not snap_dir.exists():
+        st.warning(
+            f"Snapshot directory not found: `{snap_dir}`. "
+            "Run `python scripts/capture_iv_snapshot.py` to start collecting data."
+        )
+        st.code(
+            "# Add to cron (runs daily at 4:15 PM Mon-Fri):\n"
+            "15 16 * * 1-5 /path/.venv/bin/python /path/scripts/capture_iv_snapshot.py "
+            ">> /var/log/iv_snapshot.log 2>&1",
+            language="bash",
+        )
+        return
+
+    parquet_files = sorted(snap_dir.glob("*.parquet"))
+    if not parquet_files:
+        st.info("No snapshot files found yet. The nightly capture script populates this directory.")
+        return
+
+    import pandas as pd
+    try:
+        dfs = [pd.read_parquet(f) for f in parquet_files[-30:]]  # last 30 files
+        df = pd.concat(dfs, ignore_index=True)
+    except Exception as exc:
+        st.error(f"Failed to load snapshots: {exc}")
+        return
+
+    st.success(f"Loaded {len(df):,} snapshot rows from {len(parquet_files)} files.")
+
+    tickers = sorted(df["ticker"].unique()) if "ticker" in df.columns else []
+    if not tickers:
+        st.warning("No ticker column found in snapshot data.")
+        return
+
+    selected = st.selectbox("Select ticker", tickers)
+    df_t = df[df["ticker"] == selected].sort_values("snapshot_date") if "snapshot_date" in df.columns else df[df["ticker"] == selected]
+
+    if df_t.empty:
+        st.info(f"No data for {selected}.")
+        return
+
+    has_enough = len(df_t) >= IV_SNAPSHOT_MIN_HISTORY
+    if not has_enough:
+        st.warning(
+            f"{selected}: only {len(df_t)} snapshots (need {IV_SNAPSHOT_MIN_HISTORY} for real IV rank). "
+            "Using HV×1.15 proxy for now."
+        )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if "atm_iv" in df_t.columns:
+            st.metric("Latest ATM IV", f"{df_t['atm_iv'].iloc[-1]:.1f}%")
+        if "iv_rank" in df_t.columns:
+            st.metric("IV Rank", f"{df_t['iv_rank'].iloc[-1]:.0f}%" if has_enough else "proxy")
+    with col2:
+        if "open_interest" in df_t.columns:
+            st.metric("Open Interest", f"{df_t['open_interest'].iloc[-1]:,.0f}")
+        if "volume" in df_t.columns:
+            st.metric("Options Volume", f"{df_t['volume'].iloc[-1]:,.0f}")
+
+    if "atm_iv" in df_t.columns and "snapshot_date" in df_t.columns:
+        import plotly.express as px
+        fig = px.line(df_t, x="snapshot_date", y="atm_iv", title=f"{selected} — ATM IV History")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(df_t.tail(20), use_container_width=True)
+
+
+# ─── Page: Portfolio Overview ─────────────────────────────────────────────────
+
+def page_portfolio_overview():
+    st.title("💼 Portfolio Overview")
+    st.caption("Live view of open positions, risk utilization, and P&L.")
+
+    try:
+        from src.risk.portfolio import load_positions, PortfolioRisk
+        from src.risk.portfolio import check_portfolio_limits
+    except ImportError:
+        st.error("Portfolio module not available.")
+        return
+
+    positions = load_positions()
+    open_pos = [p for p in positions if p.status == "OPEN"]
+
+    if not open_pos:
+        st.info("No open positions. Run nightly scan and paper-trade a signal to see positions here.")
+        return
+
+    import pandas as pd
+    rows = []
+    total_risk = 0.0
+    for p in open_pos:
+        rows.append({
+            "Ticker": p.ticker,
+            "Strategy": p.strategy,
+            "Direction": p.direction,
+            "Entry": p.entry_date,
+            "Expiry": p.expiration,
+            "DTE@Entry": p.dte_at_entry,
+            "Contracts": p.contracts,
+            "Credit/Debit": p.net_credit,
+            "Max Risk": p.max_risk,
+            "Total Risk $": p.total_risk,
+            "Is Long": getattr(p, "is_long_option", False),
+        })
+        total_risk += p.total_risk
+
+    df = pd.DataFrame(rows)
+    long_count = df["Is Long"].sum()
+    credit_count = len(df) - long_count
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Open Positions", len(open_pos))
+    c2.metric("Long Options", int(long_count))
+    c3.metric("Credit Spreads", int(credit_count))
+    c4.metric("Total Risk $", f"${total_risk:,.0f}")
+
+    st.dataframe(df, use_container_width=True)
+
+    # Direction balance
+    direction_counts = df.groupby("Direction").size().reset_index(name="Count")
+    import plotly.express as px
+    fig = px.pie(direction_counts, names="Direction", values="Count", title="Direction Balance")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 # ─── Router ───────────────────────────────────────────────────────────────────
 
 if page == "Ticker Analysis":
     render_ticker_analysis()
 elif page == "Today's Picks":
     page_todays_picks()
+elif page == "Portfolio Overview":
+    page_portfolio_overview()
+elif page == "IV Snapshots":
+    page_iv_snapshots()
 elif page == "IV Heatmap":
     page_iv_heatmap()
 elif page == "Regime Map":

@@ -25,6 +25,8 @@ import yfinance as yf
 from config.settings import (
     PROFIT_TARGET_PCT, STOP_LOSS_PCT, SIGNALS_DIR,
     VIX_DEFENSIVE_LEVEL, VIX_SPIKE_WINDOW, VIX_SPIKE_THRESHOLD_PCT,
+    LONG_OPTION_PROFIT_TARGET_PCT, LONG_OPTION_STOP_LOSS_PCT,
+    LONG_OPTION_TIME_STOP_DTE,
 )
 from src.risk.portfolio import load_positions, close_position, OpenPosition
 from src.pipeline.outcome_tracker import record_exit
@@ -159,6 +161,24 @@ def _check_position(
     if current_price is None:
         return None
 
+    # ── Long Option Route ─────────────────────────────────────────────────────
+    is_long = getattr(pos, "is_long_option", False) or pos.strategy in ("LONG_CALL", "LONG_PUT")
+    if is_long:
+        alert = _check_long_option(pos, current_price, today)
+        if alert:
+            # Auto-close: record exit in outcome_tracker
+            if alert.action == "CLOSE" and getattr(pos, "trade_id", ""):
+                try:
+                    record_exit(
+                        pos.trade_id,
+                        exit_price=alert.current_spread_value,
+                        close_reason=alert.alert_type,
+                    )
+                    logger.info(f"Auto-closed long option {pos.ticker} [{alert.alert_type}]")
+                except Exception as exc:
+                    logger.warning(f"Auto-close record_exit failed for {pos.ticker}: {exc}")
+        return alert
+
     # For credit spreads: estimate current spread value from intrinsic value
     if pos.net_credit > 0:
         estimated_spread_value = _estimate_credit_spread_value(
@@ -204,6 +224,50 @@ def _check_position(
                 current_price=current_price,
                 entry_credit=entry_value,
                 current_spread_value=current_value,
+                pnl_pct=-loss_pct,
+                action="CLOSE",
+                priority=1,
+            )
+
+    # Debit spread: estimate value and compare to entry debit
+    if pos.net_credit < 0:
+        estimated_value = _estimate_debit_spread_value(pos, current_price)
+        entry_debit = abs(pos.net_credit)
+        gain_pct = (estimated_value - entry_debit) / entry_debit * 100 if entry_debit > 0 else 0
+        loss_pct = -gain_pct
+
+        if gain_pct >= profit_target_pct:
+            return MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
+                ticker=pos.ticker,
+                strategy=pos.strategy,
+                alert_type="PROFIT_TARGET",
+                message=(
+                    f"DEBIT SPREAD PROFIT TARGET +{gain_pct:.0f}%: "
+                    f"spread ≈ ${estimated_value:.2f} vs debit ${entry_debit:.2f}. "
+                    f"Stock at ${current_price:.2f}"
+                ),
+                current_price=current_price,
+                entry_credit=entry_debit,
+                current_spread_value=estimated_value,
+                pnl_pct=gain_pct,
+                action="CLOSE",
+                priority=1,
+            )
+        if loss_pct >= stop_loss_pct:
+            return MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
+                ticker=pos.ticker,
+                strategy=pos.strategy,
+                alert_type="STOP_LOSS",
+                message=(
+                    f"DEBIT SPREAD STOP LOSS -{loss_pct:.0f}%: "
+                    f"spread ≈ ${estimated_value:.2f} vs debit ${entry_debit:.2f}. "
+                    f"Stock at ${current_price:.2f}"
+                ),
+                current_price=current_price,
+                entry_credit=entry_debit,
+                current_spread_value=estimated_value,
                 pnl_pct=-loss_pct,
                 action="CLOSE",
                 priority=1,
@@ -306,6 +370,148 @@ def _yfinance_fallback(ticker: str) -> Optional[float]:
     except Exception as exc:
         logger.debug(f"{ticker}: yfinance fallback failed: {exc}")
         return None
+
+
+
+def _check_long_option(
+    pos: "OpenPosition",
+    current_price: float,
+    today,
+    profit_target_pct: float = LONG_OPTION_PROFIT_TARGET_PCT,
+    stop_loss_pct: float = LONG_OPTION_STOP_LOSS_PCT,
+    time_stop_dte: int = LONG_OPTION_TIME_STOP_DTE,
+) -> Optional[MonitorAlert]:
+    """
+    Exit rules for LONG_CALL / LONG_PUT positions.
+
+    Profit target : premium gained ≥ 100 % of entry debit (2× debit)
+    Stop loss     : premium lost   ≥  50 % of entry debit (0.5× debit)
+    Time stop     : ≤ 10 DTE remaining → close to avoid gamma/theta drain
+    """
+    try:
+        exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d").date()
+        dte_remaining = (exp_date - today).days
+    except Exception as exc:
+        logger.debug(f"{pos.ticker}: expiry parse error: {exc}")
+        dte_remaining = 999
+
+    # Time-stop check FIRST (most mechanical rule)
+    if 0 < dte_remaining <= time_stop_dte:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="TIME_STOP",
+            message=(
+                f"LONG OPTION TIME-STOP: {dte_remaining} DTE ≤ {time_stop_dte}. "
+                "Close to avoid accelerated theta decay."
+            ),
+            current_price=current_price,
+            action="CLOSE",
+            priority=1,
+        )
+    if dte_remaining <= 0:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="EXPIRED",
+            message=f"Long option EXPIRED on {pos.expiration}. Record outcome.",
+            current_price=current_price,
+            action="CLOSE",
+            priority=1,
+        )
+
+    # debit paid is stored as |net_credit| (negative net_credit means debit)
+    entry_debit = abs(pos.net_credit) if pos.net_credit != 0 else pos.max_risk
+    if entry_debit <= 0:
+        logger.debug(f"{pos.ticker}: entry_debit=0, skipping long-option P&L check")
+        return None
+
+    # Estimate current option value
+    current_option_value = _estimate_long_option_value(pos, current_price)
+    gain = current_option_value - entry_debit
+    gain_pct = gain / entry_debit * 100
+
+    # Profit target: +100% gain (option doubled)
+    if gain_pct >= profit_target_pct:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="PROFIT_TARGET",
+            message=(
+                f"LONG OPTION PROFIT TARGET +{gain_pct:.0f}%: "
+                f"option ≈ ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
+                f"Stock at ${current_price:.2f}"
+            ),
+            current_price=current_price,
+            entry_credit=entry_debit,
+            current_spread_value=current_option_value,
+            pnl_pct=gain_pct,
+            action="CLOSE",
+            priority=1,
+        )
+
+    # Stop loss: -50% loss
+    if gain_pct <= -stop_loss_pct:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="STOP_LOSS",
+            message=(
+                f"LONG OPTION STOP LOSS {gain_pct:.0f}%: "
+                f"option ≈ ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
+                f"Stock at ${current_price:.2f}"
+            ),
+            current_price=current_price,
+            entry_credit=entry_debit,
+            current_spread_value=current_option_value,
+            pnl_pct=gain_pct,
+            action="CLOSE",
+            priority=1,
+        )
+
+    return None
+
+
+def _estimate_long_option_value(pos: "OpenPosition", current_price: float) -> float:
+    """
+    Rough intrinsic + small time-value estimate for a long option.
+    Real monitoring should use live options quotes.
+    """
+    is_call = pos.strategy in ("LONG_CALL",)
+    strike = pos.short_strike if pos.short_strike > 0 else pos.long_strike
+    if strike <= 0:
+        return abs(pos.net_credit)  # no strike info — return entry cost
+
+    if is_call:
+        intrinsic = max(current_price - strike, 0)
+    else:
+        intrinsic = max(strike - current_price, 0)
+
+    # Time value: rough proxy using 20% of entry debit decaying linearly
+    entry_debit = abs(pos.net_credit) if pos.net_credit != 0 else pos.max_risk
+    time_val = entry_debit * 0.20
+    return round(intrinsic + time_val, 2)
+
+
+def _estimate_debit_spread_value(pos: "OpenPosition", current_price: float) -> float:
+    """
+    Rough estimate of current debit-spread value from intrinsic value.
+    Used for BULL_CALL_SPREAD and BEAR_PUT_SPREAD.
+    """
+    if pos.strategy in ("BULL_CALL_SPREAD", "BULL_CALL"):
+        # Value = max(current_price - long_strike, 0) - max(current_price - short_strike, 0)
+        long_val = max(current_price - pos.long_strike, 0)
+        short_val = max(current_price - pos.short_strike, 0)
+        return max(round(long_val - short_val, 2), 0.01)
+    elif pos.strategy in ("BEAR_PUT_SPREAD", "BEAR_PUT"):
+        long_val = max(pos.long_strike - current_price, 0)
+        short_val = max(pos.short_strike - current_price, 0)
+        return max(round(long_val - short_val, 2), 0.01)
+    return abs(pos.net_credit)
 
 
 def _estimate_credit_spread_value(
