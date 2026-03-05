@@ -180,6 +180,30 @@ def run_nightly_scan(
             iv_map[ticker] = iv
     logger.info(f"  IV analyzed: {len(iv_map)} tickers")
 
+    # ── Step 6b: IBKR Real-time Enrichment ───────────────────────────────────
+    logger.info("Step 6b: IBKR real-time enrichment (options flow, live IV)")
+    rt_enrichment: dict[str, dict] = {}
+    if not dry_run:
+        try:
+            from src.data.ibkr_client import connect_ibkr, disconnect_ibkr
+            from src.data.ibkr_realtime import fetch_realtime_enrichment
+
+            ib_rt = connect_ibkr()
+            if ib_rt:
+                # Only enrich tickers that passed IV analysis (top candidates)
+                tickers_to_enrich = [t for t in iv_map][:30]  # cap at 30 (IBKR pacing)
+                for t in tickers_to_enrich:
+                    stock_df = qualified.get(t)
+                    rt = fetch_realtime_enrichment(ib_rt, t, stock_df=stock_df)
+                    if rt:
+                        rt_enrichment[t] = rt
+                disconnect_ibkr(ib_rt)
+                logger.info(f"  Enriched {len(rt_enrichment)} tickers with IBKR real-time data")
+            else:
+                logger.info("  IBKR not available — skipping real-time enrichment")
+        except Exception as exc:
+            logger.warning(f"  IBKR real-time enrichment failed (non-fatal): {exc}")
+
     # ── Step 7: Strategy Selection ────────────────────────────────────────────
     logger.info("Step 7: Selecting strategies")
     recommendations = []
@@ -201,6 +225,19 @@ def run_nightly_scan(
             rs = rs_map.get(ticker)
             if rs:
                 _adjust_confidence_for_rs(rec, rs)
+
+            # Adjust confidence based on real-time options flow
+            rt = rt_enrichment.get(ticker, {})
+            flow_score = rt.get("flow_score", 0)
+            dominant_side = rt.get("dominant_side", "NEUTRAL")
+            if flow_score > 60:  # Unusual activity threshold
+                if (dominant_side == "CALLS" and rec.direction == "BULLISH") or \
+                   (dominant_side == "PUTS" and rec.direction == "BEARISH"):
+                    rec.confidence = min(rec.confidence * 1.15, 0.95)  # boost aligned flow
+                elif (dominant_side == "CALLS" and rec.direction == "BEARISH") or \
+                     (dominant_side == "PUTS" and rec.direction == "BULLISH"):
+                    rec.confidence = rec.confidence * 0.85  # penalize counter-flow
+
             recommendations.append(rec)
 
     # ── VIX Tier Overlay ──────────────────────────────────────────────────────
@@ -247,7 +284,16 @@ def run_nightly_scan(
 
         if dry_run:
             # Skip real options fetching in dry_run mode
-            trades.append(_build_trade_stub(rec, qualified[ticker], regime_map, iv_map, rs_map, market_ctx, beta_map))
+            trade_stub = _build_trade_stub(rec, qualified[ticker], regime_map, iv_map, rs_map, market_ctx, beta_map)
+            _rt = rt_enrichment.get(ticker, {})
+            trade_stub["context"]["options_flow"] = {
+                "flow_score": _rt.get("flow_score", 0),
+                "dominant_side": _rt.get("dominant_side", "NEUTRAL"),
+                "put_call_volume_ratio": _rt.get("put_call_volume_ratio", 1.0),
+                "volume_pace": _rt.get("volume_pace", 1.0),
+                "live_iv": _rt.get("iv_pct"),
+            }
+            trades.append(trade_stub)
             continue
 
         # Fetch and filter options chain
@@ -264,6 +310,14 @@ def run_nightly_scan(
             continue
 
         trade_dict = _build_trade_dict(rec, trade_obj, qualified, regime_map, iv_map, rs_map, ticker, price, market_ctx, beta_map)
+        _rt = rt_enrichment.get(ticker, {})
+        trade_dict["context"]["options_flow"] = {
+            "flow_score": _rt.get("flow_score", 0),
+            "dominant_side": _rt.get("dominant_side", "NEUTRAL"),
+            "put_call_volume_ratio": _rt.get("put_call_volume_ratio", 1.0),
+            "volume_pace": _rt.get("volume_pace", 1.0),
+            "live_iv": _rt.get("iv_pct"),
+        }
         trades.append(trade_dict)
 
         time.sleep(0.3)  # Rate limiting between options fetches

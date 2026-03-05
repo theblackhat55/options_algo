@@ -56,14 +56,6 @@ class TradeOutcome:
     prob_profit: float
     confidence: float
 
-    # V2: Market context at entry (for regime correlation analysis)
-    entry_vix: float = 0.0           # VIX level at trade entry
-    entry_spy_5d: float = 0.0        # SPY 5-day return at entry (%)
-    entry_vix_tier: str = ""         # NORMAL / CAUTION / DEFENSIVE
-    entry_roc_3d: float = 0.0        # Stock 3-day ROC at entry (%)
-    entry_beta: float = 1.0          # 60-day beta vs SPY at entry
-    entry_sector: str = ""           # GICS sector at entry
-
     # Outcome fields (filled on close)
     exit_date: str = ""
     exit_price: float = 0.0
@@ -79,6 +71,16 @@ class TradeOutcome:
     entry_vix_tier: str = ""      # NORMAL / CAUTION / DEFENSIVE / LIQUIDATION
     entry_spy_5d: float = 0.0     # SPY 5-day return at entry (%)
     entry_roc_3d: float = 0.0     # Stock 3-day ROC at entry (%) — momentum context
+    entry_beta: float = 1.0       # 60-day beta vs SPY at entry
+    entry_sector: str = ""        # GICS sector at entry
+
+    # ── IBKR Real-time Features at Entry ─────────────────────────────────────
+    options_flow_score: float = 0.0    # 0-100 unusual options activity at entry
+    dominant_flow: str = ""            # CALLS / PUTS / NEUTRAL at entry
+    put_call_volume_ratio: float = 1.0 # put vol / call vol at entry
+    volume_pace: float = 1.0           # intraday volume / 20d avg at entry
+    live_iv_at_entry: float = 0.0      # real-time ATM IV at entry (%)
+    iv_skew_at_entry: float = 0.0      # put IV - call IV at entry
 
 
 def record_entry(
@@ -104,6 +106,7 @@ def record_entry(
     reg = context.get("regime_detail", {})
     rs = context.get("rs_detail", {})
     mkt = context.get("market_snapshot", {})   # V2: market context at entry
+    flow = context.get("options_flow", {})     # IBKR real-time flow at entry
 
     # Handle both credit and debit spreads
     credit = trade.get("net_credit") or -(trade.get("net_debit", 0))
@@ -145,6 +148,13 @@ def record_entry(
         entry_roc_3d=float(reg.get("roc_3d", 0)),
         entry_beta=float(context.get("beta", 1.0)),
         entry_sector=str(context.get("sector", "")),
+        # IBKR real-time fields at entry
+        options_flow_score=float(flow.get("flow_score", 0.0)),
+        dominant_flow=str(flow.get("dominant_side", "")),
+        put_call_volume_ratio=float(flow.get("put_call_volume_ratio", 1.0)),
+        volume_pace=float(flow.get("volume_pace", 1.0)),
+        live_iv_at_entry=float(flow.get("live_iv") or 0.0),
+        iv_skew_at_entry=float(iv.get("skew", 0.0)),
     )
 
     _append_outcome(outcome)

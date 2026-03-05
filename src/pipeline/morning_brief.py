@@ -4,6 +4,11 @@ src/pipeline/morning_brief.py
 Format the nightly scan signal into a WhatsApp-friendly message.
 Delivered via OpenClaw at 9:00 AM ET.
 
+At market open, re-enriches top picks with LIVE IBKR data (options flow,
+live IV, volume pace) — replacing the empty pre-market values from the
+nightly scan. Enriched data is also saved back to the signal JSON so
+the Streamlit dashboard reflects live context.
+
 Usage:
     python -m src.pipeline.morning_brief
 
@@ -15,17 +20,111 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from config.settings import SIGNALS_DIR
+from config.settings import SIGNALS_DIR, IBKR_HOST, IBKR_PORT
 
 logger = logging.getLogger(__name__)
 
 # WhatsApp-friendly formatting: no markdown, plain text
 MAX_LINES = 50
 SEPARATOR = "─" * 30
+
+
+def _ibkr_reachable() -> bool:
+    """Quick TCP check — avoids hanging if IB Gateway is down."""
+    try:
+        with socket.create_connection((IBKR_HOST, IBKR_PORT), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def _enrich_picks_live(picks: list[dict]) -> tuple[list[dict], str]:
+    """
+    Re-fetch IBKR options flow / live IV for each pick at market-open time.
+
+    Returns:
+        (enriched_picks, ibkr_status_note)
+        ibkr_status_note is a short string for the brief footer:
+          "IBKR: live data ✓ (3/3 tickers)"
+          "IBKR: partial (1/3 tickers)"
+          "IBKR: unavailable — pre-market data shown"
+    """
+    if not picks:
+        return picks, ""
+
+    if not _ibkr_reachable():
+        logger.warning("Morning brief: IBKR not reachable — skipping live enrichment")
+        return picks, "IBKR: unavailable — pre-market flow data shown"
+
+    try:
+        from src.data.ibkr_client import connect_ibkr, disconnect_ibkr
+        from src.data.ibkr_realtime import fetch_realtime_enrichment_fast as fetch_realtime_enrichment
+    except ImportError as e:
+        logger.warning(f"Morning brief: IBKR modules not importable — {e}")
+        return picks, "IBKR: module error — pre-market flow data shown"
+
+    ib = connect_ibkr()
+    if not ib:
+        return picks, "IBKR: connection failed — pre-market flow data shown"
+
+    enriched_count = 0
+    try:
+        for p in picks:
+            ticker = p.get("recommendation", {}).get("ticker")
+            if not ticker:
+                continue
+            try:
+                rt = fetch_realtime_enrichment(ib, ticker)
+                if rt and rt.get("data_quality") != "NONE":
+                    # Merge live data into context.options_flow
+                    p.setdefault("context", {})["options_flow"] = {
+                        "flow_score":           rt.get("flow_score", 0),
+                        "dominant_side":        rt.get("dominant_side", "NEUTRAL"),
+                        "put_call_volume_ratio": rt.get("put_call_volume_ratio", 1.0),
+                        "volume_pace":          rt.get("volume_pace", 1.0),
+                        "live_iv":              rt.get("iv_pct"),
+                        "iv_skew":              rt.get("skew"),
+                        "source":               "ibkr_live_morning",
+                        "timestamp":            rt.get("timestamp"),
+                    }
+                    # Confidence adjustment: boost/penalize based on flow alignment
+                    direction = p.get("recommendation", {}).get("direction", "NEUTRAL")
+                    dominant = rt.get("dominant_side", "NEUTRAL")
+                    flow_score = rt.get("flow_score", 0)
+                    if flow_score > 60:
+                        conf = p.get("recommendation", {}).get("confidence", 0.5)
+                        if (dominant == "CALLS" and direction == "BULLISH") or \
+                           (dominant == "PUTS" and direction == "BEARISH"):
+                            p["recommendation"]["confidence"] = min(conf * 1.15, 0.95)
+                        elif (dominant == "CALLS" and direction == "BEARISH") or \
+                             (dominant == "PUTS" and direction == "BULLISH"):
+                            p["recommendation"]["confidence"] = conf * 0.85
+                    enriched_count += 1
+                    logger.info(f"  {ticker}: live enrichment OK "
+                                f"(flow={rt.get('flow_score',0):.0f}, "
+                                f"iv={rt.get('iv_pct')}%)")
+            except Exception as exc:
+                logger.warning(f"  {ticker}: live enrichment failed — {exc}")
+    finally:
+        try:
+            disconnect_ibkr(ib)
+        except Exception:
+            pass
+
+    total = len(picks)
+    if enriched_count == total:
+        note = f"IBKR: live data OK ({enriched_count}/{total} tickers)"
+    elif enriched_count > 0:
+        note = f"IBKR: partial ({enriched_count}/{total} tickers)"
+    else:
+        note = "IBKR: no live data — check market hours"
+
+    return picks, note
 
 
 def format_morning_brief(signal: dict = None) -> str:
@@ -47,6 +146,17 @@ def format_morning_brief(signal: dict = None) -> str:
     scan_date = signal.get("scan_date", "unknown")
     mkt = signal.get("market_context", {})
     regime_dist = signal.get("regime_distribution", {})
+
+    # ── Live IBKR enrichment at market open ──────────────────────────────────
+    ibkr_note = ""
+    if picks:
+        logger.info("Morning brief: fetching live IBKR enrichment...")
+        picks, ibkr_note = _enrich_picks_live(picks)
+        signal["top_picks"] = picks
+        signal["ibkr_live_enrichment"] = ibkr_note
+        signal["ibkr_enriched_at"] = datetime.utcnow().isoformat()
+        # Save enriched signal back to disk so dashboard reflects live data
+        _save_enriched_signal(signal)
 
     lines = [
         f"OPTIONS ALGO PICKS — {scan_date}",
@@ -107,6 +217,17 @@ def format_morning_brief(signal: dict = None) -> str:
         iv_trend = iv.get("iv_trend", "")
         lines.append(f"IV Rank:  {iv_rank:.0f}% | IV/HV: {iv_hv:.2f} | Trend: {iv_trend}")
 
+        # Options flow (if available from IBKR real-time enrichment)
+        flow = ctx.get("options_flow", {})
+        flow_score = flow.get("flow_score", 0)
+        dominant = flow.get("dominant_side", "")
+        vol_pace = flow.get("volume_pace", 1.0)
+        if flow_score > 0 or vol_pace != 1.0:
+            flow_txt = f"Flow:     Score={flow_score:.0f} | {dominant} | Vol pace={vol_pace:.1f}x"
+            if flow.get("live_iv"):
+                flow_txt += f" | Live IV={flow.get('live_iv'):.1f}%"
+            lines.append(flow_txt)
+
         # Technical context
         adx = reg.get("adx", 0)
         rsi = reg.get("rsi", 0)
@@ -137,8 +258,26 @@ def format_morning_brief(signal: dict = None) -> str:
         f"{len(picks)} picks"
     )
     lines.append(f"Generated: {signal.get('generated_at', '')[:16]}")
+    if ibkr_note:
+        lines.append(ibkr_note)
 
     return "\n".join(lines)
+
+
+def _save_enriched_signal(signal: dict) -> None:
+    """Save the IBKR-enriched signal back to disk (overwrites latest + dated file)."""
+    try:
+        scan_date = signal.get("scan_date", datetime.utcnow().date().isoformat())
+        for path in [
+            SIGNALS_DIR / "options_signal_latest.json",
+            SIGNALS_DIR / f"options_signal_{scan_date}.json",
+        ]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(signal, f, indent=2, default=str)
+        logger.info("Morning brief: enriched signal saved to disk")
+    except Exception as exc:
+        logger.warning(f"Morning brief: failed to save enriched signal — {exc}")
 
 
 def _format_trade(trade: dict, strategy_name: str) -> str:

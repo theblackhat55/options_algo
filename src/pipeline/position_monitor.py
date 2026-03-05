@@ -29,6 +29,13 @@ from config.settings import (
 from src.risk.portfolio import load_positions, close_position, OpenPosition
 from src.pipeline.outcome_tracker import record_exit
 
+try:
+    from src.data.ibkr_client import connect_ibkr, disconnect_ibkr, fetch_stock_snapshot
+except Exception:
+    connect_ibkr = None  # type: ignore
+    disconnect_ibkr = None  # type: ignore
+    fetch_stock_snapshot = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,19 +78,37 @@ def monitor_positions(
     alerts = []
     today = date.today()
 
-    # ── VIX Spike Pre-Check ───────────────────────────────────────────────────
-    # Pull current VIX before checking individual positions.  If VIX is at
-    # DEFENSIVE level or above, flag all open credit spreads for review.
-    _vix_spike_alerts = _check_vix_spike_for_positions(positions)
-    alerts.extend(_vix_spike_alerts)
-
-    for pos in positions:
+    ib_monitor = None
+    if connect_ibkr:
         try:
-            alert = _check_position(pos, profit_target_pct, stop_loss_pct, today)
-            if alert:
-                alerts.append(alert)
+            ib_monitor = connect_ibkr()
+            if ib_monitor:
+                logger.info("Connected to IBKR for live position monitoring")
         except Exception as exc:
-            logger.error(f"Monitor failed for {pos.ticker}: {exc}")
+            logger.warning(f"IBKR monitor connection failed: {exc}")
+            ib_monitor = None
+
+    try:
+        # ── VIX Spike Pre-Check ───────────────────────────────────────────────
+        # Pull current VIX before checking individual positions.  If VIX is at
+        # DEFENSIVE level or above, flag all open credit spreads for review.
+        _vix_spike_alerts = _check_vix_spike_for_positions(positions)
+        alerts.extend(_vix_spike_alerts)
+
+        for pos in positions:
+            try:
+                alert = _check_position(pos, profit_target_pct, stop_loss_pct, today, ib_monitor)
+                if alert:
+                    alerts.append(alert)
+            except Exception as exc:
+                logger.error(f"Monitor failed for {pos.ticker}: {exc}")
+
+    finally:
+        if ib_monitor and disconnect_ibkr:
+            try:
+                disconnect_ibkr(ib_monitor)
+            except Exception:
+                pass
 
     if alerts:
         logger.info(f"Generated {len(alerts)} alerts")
@@ -98,6 +123,7 @@ def _check_position(
     profit_target_pct: float,
     stop_loss_pct: float,
     today: date,
+    ib_monitor=None,
 ) -> Optional[MonitorAlert]:
     """Check a single position for exit signals."""
 
@@ -129,14 +155,8 @@ def _check_position(
         pass
 
     # ── Price-based P&L Check ──────────────────────────────────────────────────
-    # Get current stock price to estimate spread value
-    try:
-        ticker_obj = yf.Ticker(pos.ticker)
-        hist = ticker_obj.history(period="1d")
-        if hist.empty:
-            return None
-        current_price = float(hist["Close"].iloc[-1])
-    except Exception:
+    current_price = _get_current_price(pos.ticker, ib_monitor)
+    if current_price is None:
         return None
 
     # For credit spreads: estimate current spread value from intrinsic value
@@ -257,6 +277,35 @@ def _check_vix_spike_for_positions(positions) -> list[MonitorAlert]:
             f"VIX alert: generated {len(alerts)} VIX_SPIKE alert(s)"
         )
     return alerts
+
+
+def _get_current_price(ticker: str, ib_monitor=None) -> Optional[float]:
+    """Fetch current stock price from IBKR, fallback to yfinance."""
+    price = None
+    if ib_monitor and fetch_stock_snapshot:
+        try:
+            snap = fetch_stock_snapshot(ib_monitor, ticker)
+            if snap and snap.get("last", 0) > 0:
+                price = float(snap["last"])
+        except Exception as exc:
+            logger.debug(f"{ticker}: IBKR snapshot failed ({exc}) — falling back to yfinance")
+
+    if price is not None:
+        return price
+
+    return _yfinance_fallback(ticker)
+
+
+def _yfinance_fallback(ticker: str) -> Optional[float]:
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        hist = ticker_obj.history(period="1d")
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception as exc:
+        logger.debug(f"{ticker}: yfinance fallback failed: {exc}")
+        return None
 
 
 def _estimate_credit_spread_value(

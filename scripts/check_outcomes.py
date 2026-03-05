@@ -39,7 +39,7 @@ def check_all_outcomes():
     today = date.today()
     tickers = list(set(o.ticker for o in open_trades))
 
-    data = download_universe(tickers, period="5d")
+    data = download_universe(tickers, period="1mo")
 
     alerts = []
 

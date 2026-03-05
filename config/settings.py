@@ -133,3 +133,11 @@ MAX_PER_SECTOR = int(os.getenv("MAX_PER_SECTOR", "2"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# ── IBKR Settings ─────────────────────────────────────────────────────────────
+IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
+IBKR_CLIENT_ID_OPTIONS = int(os.getenv("IBKR_CLIENT_ID_OPTIONS", "11"))
+IBKR_ENABLED = os.getenv("IBKR_ENABLED", "true").lower() == "true"
+IBKR_TIMEOUT = int(os.getenv("IBKR_TIMEOUT", "10"))
+IBKR_MAX_CONTRACTS_PER_TICKER = int(os.getenv("IBKR_MAX_CONTRACTS_PER_TICKER", "50"))
