@@ -42,6 +42,8 @@ class OpenPosition:
     close_price: float = 0.0
     close_date: str = ""
     pnl: float = 0.0
+    is_long_option: bool = False   # True for LONG_CALL / LONG_PUT
+    trade_id: str = ""             # Links back to outcome_tracker
 
 
 @dataclass
