@@ -678,21 +678,40 @@ def page_iv_snapshots():
 
     import pandas as pd
     try:
-        dfs = [pd.read_parquet(f) for f in parquet_files[-30:]]  # last 30 files
+        dfs = []
+        for f in parquet_files[-50:]:  # last 50 files (one per ticker)
+            df_part = pd.read_parquet(f)
+            # FIX #10: Extract ticker from filename: AAPL_iv_history.parquet -> AAPL
+            ticker_name = f.stem.replace("_iv_history", "").upper()
+            df_part["ticker"] = ticker_name
+            # Normalize column names for the dashboard
+            if "date" in df_part.columns and "snapshot_date" not in df_part.columns:
+                df_part = df_part.rename(columns={"date": "snapshot_date"})
+            if "avg_oi" in df_part.columns and "open_interest" not in df_part.columns:
+                df_part = df_part.rename(columns={"avg_oi": "open_interest"})
+            if "avg_volume" in df_part.columns and "volume" not in df_part.columns:
+                df_part = df_part.rename(columns={"avg_volume": "volume"})
+            dfs.append(df_part)
+        if not dfs:
+            st.info("No snapshot data could be loaded.")
+            return
         df = pd.concat(dfs, ignore_index=True)
     except Exception as exc:
         st.error(f"Failed to load snapshots: {exc}")
         return
 
-    st.success(f"Loaded {len(df):,} snapshot rows from {len(parquet_files)} files.")
+    st.success(f"Loaded {len(df):,} snapshot rows from {len(parquet_files)} ticker files.")
 
     tickers = sorted(df["ticker"].unique()) if "ticker" in df.columns else []
     if not tickers:
-        st.warning("No ticker column found in snapshot data.")
+        st.warning("No ticker data found in snapshot files.")
         return
 
     selected = st.selectbox("Select ticker", tickers)
-    df_t = df[df["ticker"] == selected].sort_values("snapshot_date") if "snapshot_date" in df.columns else df[df["ticker"] == selected]
+    if "snapshot_date" in df.columns:
+        df_t = df[df["ticker"] == selected].sort_values("snapshot_date")
+    else:
+        df_t = df[df["ticker"] == selected]
 
     if df_t.empty:
         st.info(f"No data for {selected}.")
@@ -709,7 +728,14 @@ def page_iv_snapshots():
     with col1:
         if "atm_iv" in df_t.columns:
             st.metric("Latest ATM IV", f"{df_t['atm_iv'].iloc[-1]:.1f}%")
-        if "iv_rank" in df_t.columns:
+        # Compute IV rank from snapshot history if enough data
+        if has_enough and "atm_iv" in df_t.columns:
+            iv_min = df_t["atm_iv"].min()
+            iv_max = df_t["atm_iv"].max()
+            iv_current = df_t["atm_iv"].iloc[-1]
+            iv_rank_calc = (iv_current - iv_min) / (iv_max - iv_min) * 100 if iv_max > iv_min else 50
+            st.metric("IV Rank (computed)", f"{iv_rank_calc:.0f}%")
+        elif "iv_rank" in df_t.columns:
             st.metric("IV Rank", f"{df_t['iv_rank'].iloc[-1]:.0f}%" if has_enough else "proxy")
     with col2:
         if "open_interest" in df_t.columns:
@@ -720,6 +746,16 @@ def page_iv_snapshots():
     if "atm_iv" in df_t.columns and "snapshot_date" in df_t.columns:
         import plotly.express as px
         fig = px.line(df_t, x="snapshot_date", y="atm_iv", title=f"{selected} — ATM IV History")
+        if "skew" in df_t.columns:
+            import plotly.graph_objects as go
+            fig.add_trace(go.Scatter(
+                x=df_t["snapshot_date"], y=df_t["skew"],
+                name="Skew", yaxis="y2",
+                line=dict(color="orange", dash="dot"),
+            ))
+            fig.update_layout(
+                yaxis2=dict(title="Skew", overlaying="y", side="right"),
+            )
         st.plotly_chart(fig, use_container_width=True)
 
     st.dataframe(df_t.tail(20), use_container_width=True)
@@ -745,6 +781,9 @@ def page_portfolio_overview():
         st.info("No open positions. Run nightly scan and paper-trade a signal to see positions here.")
         return
 
+    # FIX #11: Use check_portfolio_limits() for risk budget metrics
+    portfolio_risk = check_portfolio_limits()
+
     import pandas as pd
     rows = []
     total_risk = 0.0
@@ -761,6 +800,7 @@ def page_portfolio_overview():
             "Max Risk": p.max_risk,
             "Total Risk $": p.total_risk,
             "Is Long": getattr(p, "is_long_option", False),
+            "Trade ID": getattr(p, "trade_id", ""),
         })
         total_risk += p.total_risk
 
@@ -768,19 +808,32 @@ def page_portfolio_overview():
     long_count = df["Is Long"].sum()
     credit_count = len(df) - long_count
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Positions", len(open_pos))
     c2.metric("Long Options", int(long_count))
     c3.metric("Credit Spreads", int(credit_count))
     c4.metric("Total Risk $", f"${total_risk:,.0f}")
+    c5.metric("Risk Budget Left", f"${portfolio_risk.remaining_risk_budget:,.0f}")
+
+    # Directional exposure warning
+    if portfolio_risk.notes:
+        st.warning(f"⚠️ {portfolio_risk.notes}")
+    if not portfolio_risk.can_add_position:
+        st.error("Cannot add more positions — limit reached or risk budget exhausted.")
 
     st.dataframe(df, use_container_width=True)
 
     # Direction balance
-    direction_counts = df.groupby("Direction").size().reset_index(name="Count")
-    import plotly.express as px
-    fig = px.pie(direction_counts, names="Direction", values="Count", title="Direction Balance")
-    st.plotly_chart(fig, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        direction_counts = df.groupby("Direction").size().reset_index(name="Count")
+        import plotly.express as px
+        fig = px.pie(direction_counts, names="Direction", values="Count", title="Direction Balance")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        strategy_counts = df.groupby("Strategy").size().reset_index(name="Count")
+        fig2 = px.bar(strategy_counts, x="Strategy", y="Count", title="Strategy Breakdown")
+        st.plotly_chart(fig2, use_container_width=True)
 
 
 # ─── Router ───────────────────────────────────────────────────────────────────

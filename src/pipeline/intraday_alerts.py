@@ -124,8 +124,12 @@ def _check_vix_spike() -> list[IntradayAlert]:
         if vix_hist.empty or len(vix_hist) < 2:
             return alerts
         vix_now = round(float(vix_hist["Close"].iloc[-1]), 1)
-        window = min(VIX_SPIKE_WINDOW, len(vix_hist))
-        vix_avg = round(float(vix_hist["Close"].tail(window).mean()), 1)
+        # FIX #6: Exclude today's value from rolling average so a spike today
+        # isn't diluted by including itself in the baseline.
+        window = min(VIX_SPIKE_WINDOW, len(vix_hist) - 1)
+        if window < 1:
+            return alerts
+        vix_avg = round(float(vix_hist["Close"].iloc[-(window + 1):-1].mean()), 1)
     except Exception as exc:
         logger.warning(f"VIX intraday fetch failed: {exc}")
         return alerts
@@ -203,7 +207,9 @@ def _scan_breakouts(universe: list[str]) -> list[IntradayAlert]:
 def _check_breakout(ticker: str) -> Optional[IntradayAlert]:
     """
     Check a single ticker for a volume-confirmed breakout or breakdown.
-    Uses yfinance for real-time data (fallback if no live feed configured).
+
+    FIX #13: Use analyze_levels() from src.analysis.levels for S/R levels
+    consistent with the nightly scan, falling back to quantile method.
     """
     try:
         df = yf.Ticker(ticker).history(period=f"{SR_LOOKBACK_DAYS + 5}d")
@@ -213,19 +219,38 @@ def _check_breakout(ticker: str) -> Optional[IntradayAlert]:
         logger.debug(f"{ticker}: yfinance fetch failed: {exc}")
         return None
 
-    # Simple rolling support/resistance from last SR_LOOKBACK_DAYS bars
-    lookback_df = df.tail(SR_LOOKBACK_DAYS)
-    resistance = float(lookback_df["High"].quantile(0.90))
-    support = float(lookback_df["Low"].quantile(0.10))
     current_price = float(df["Close"].iloc[-1])
     current_vol = float(df["Volume"].iloc[-1])
     avg_vol_20d = float(df["Volume"].tail(20).mean())
 
     # Volume confirmation
     vol_elevated = avg_vol_20d > 0 and (current_vol / avg_vol_20d) >= BREAKOUT_VOLUME_MULTIPLIER
-
     if not vol_elevated:
-        return None  # no volume confirmation → not a meaningful breakout
+        return None
+
+    # Try to use the levels module for consistent S/R with nightly scan
+    resistance = None
+    support = None
+    try:
+        from src.analysis.levels import analyze_levels
+        df_lower = df.copy()
+        df_lower.columns = [c.lower() for c in df_lower.columns]
+        levels = analyze_levels(ticker, df_lower)
+        if levels is not None:
+            if getattr(levels, "nearest_resistance", None) and levels.nearest_resistance > 0:
+                resistance = levels.nearest_resistance
+            if getattr(levels, "nearest_support", None) and levels.nearest_support > 0:
+                support = levels.nearest_support
+    except Exception as exc:
+        logger.debug(f"{ticker}: levels module unavailable ({exc}), using quantile fallback")
+
+    # Fallback to quantile method if levels module didn't produce results
+    if resistance is None or support is None:
+        lookback_df = df.tail(SR_LOOKBACK_DAYS)
+        if resistance is None:
+            resistance = float(lookback_df["High"].quantile(0.90))
+        if support is None:
+            support = float(lookback_df["Low"].quantile(0.10))
 
     # Breakout above resistance
     if current_price > resistance:
@@ -235,7 +260,7 @@ def _check_breakout(ticker: str) -> Optional[IntradayAlert]:
             message=(
                 f"BREAKOUT: {ticker} at ${current_price:.2f} > "
                 f"resistance ${resistance:.2f}. "
-                f"Volume {current_vol / avg_vol_20d:.1f}× 20d avg. "
+                f"Volume {current_vol / avg_vol_20d:.1f}x 20d avg. "
                 "Potential LONG_CALL setup."
             ),
             priority=2,
@@ -249,7 +274,7 @@ def _check_breakout(ticker: str) -> Optional[IntradayAlert]:
             message=(
                 f"BREAKDOWN: {ticker} at ${current_price:.2f} < "
                 f"support ${support:.2f}. "
-                f"Volume {current_vol / avg_vol_20d:.1f}× 20d avg. "
+                f"Volume {current_vol / avg_vol_20d:.1f}x 20d avg. "
                 "Potential LONG_PUT setup."
             ),
             priority=2,

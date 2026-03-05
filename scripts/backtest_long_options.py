@@ -173,50 +173,53 @@ def _simulate_ticker(
         entry_price = float(prices[i])
         entry_date = dates_idx[i].date()
 
-        # Compute HV-20 as IV proxy
+        # Compute HV-20 as IV proxy at entry
         log_returns = np.diff(np.log(prices[max(0, i - 22):i + 1]))
-        sigma = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) > 2 else 0.30
+        sigma_entry = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) > 2 else 0.30
 
         T = target_dte / 252.0
+
+        # FIX #18: Strike candidates scale with stock price instead of fixed $5
+        step = max(1.0, round(entry_price * 0.01 / 2.5) * 2.5)  # ~1% of price, rounded to $2.50
+        if step < 2.5:
+            step = 2.5
 
         # Select strike near target_delta
         if option_type == "CALL":
             # Start at ATM, find strike closest to target_delta
-            atm_strike = round(entry_price / 5) * 5  # nearest $5 increment
-            strike_candidates = [atm_strike - 10, atm_strike - 5, atm_strike,
-                                  atm_strike + 5, atm_strike + 10]
+            atm_strike = round(entry_price / step) * step
+            strike_candidates = [atm_strike + step * n for n in range(-2, 3)]
             best_strike = atm_strike
             best_delta_diff = float("inf")
             for sk in strike_candidates:
                 if sk <= 0:
                     continue
-                d = _estimate_delta(entry_price, sk, T, sigma, "call")
+                d = _estimate_delta(entry_price, sk, T, sigma_entry, "call")
                 if abs(d - target_delta) < best_delta_diff:
                     best_delta_diff = abs(d - target_delta)
                     best_strike = sk
             strike = best_strike
         else:
-            atm_strike = round(entry_price / 5) * 5
-            strike_candidates = [atm_strike - 10, atm_strike - 5, atm_strike,
-                                  atm_strike + 5, atm_strike + 10]
+            atm_strike = round(entry_price / step) * step
+            strike_candidates = [atm_strike + step * n for n in range(-2, 3)]
             best_strike = atm_strike
             best_delta_diff = float("inf")
             target_abs_delta = abs(target_delta)
             for sk in strike_candidates:
                 if sk <= 0:
                     continue
-                d = _estimate_delta(entry_price, sk, T, sigma, "put")
+                d = _estimate_delta(entry_price, sk, T, sigma_entry, "put")
                 if abs(abs(d) - target_abs_delta) < best_delta_diff:
                     best_delta_diff = abs(abs(d) - target_abs_delta)
                     best_strike = sk
             strike = best_strike
 
-        entry_premium = _black_scholes_price(entry_price, strike, T, r, sigma, option_type.lower())
+        entry_premium = _black_scholes_price(entry_price, strike, T, r, sigma_entry, option_type.lower())
         if entry_premium < 0.05:
             i += entry_frequency_days
             continue
 
-        delta_entry = _estimate_delta(entry_price, strike, T, sigma, option_type.lower())
+        delta_entry = _estimate_delta(entry_price, strike, T, sigma_entry, option_type.lower())
         expiry_idx = min(i + target_dte, len(df) - 1)
         expiry_date = dates_idx[expiry_idx].date()
 
@@ -232,16 +235,18 @@ def _simulate_ticker(
             dte_now = (expiry_date - current_date).days
 
             T_now = max(dte_now / 252.0, 1e-6)
-            current_premium = _black_scholes_price(current_price, strike, T_now, r, sigma, option_type.lower())
+
+            # FIX #7: Recompute sigma from rolling 20-day HV at each step
+            # instead of using constant entry sigma throughout the trade.
+            local_returns = np.diff(np.log(prices[max(0, j - 22):j + 1]))
+            sigma_now = float(np.std(local_returns) * np.sqrt(252)) if len(local_returns) > 2 else sigma_entry
+
+            current_premium = _black_scholes_price(current_price, strike, T_now, r, sigma_now, option_type.lower())
             gain_pct = (current_premium - entry_premium) / entry_premium * 100
 
-            # Time stop
-            if 0 < dte_now <= time_stop_dte:
-                exit_date = current_date
-                exit_premium = current_premium
-                exit_reason = "TIME_STOP"
-                exit_price = current_price
-                break
+            # FIX #8: Check profit target and stop loss BEFORE time stop
+            # so that a position at 9 DTE with a profit target hit gets the
+            # correct exit reason.
 
             # Profit target
             if gain_pct >= profit_target_pct:
@@ -256,6 +261,14 @@ def _simulate_ticker(
                 exit_date = current_date
                 exit_premium = current_premium
                 exit_reason = "STOP_LOSS"
+                exit_price = current_price
+                break
+
+            # Time stop (checked AFTER profit/stop — FIX #8)
+            if 0 < dte_now <= time_stop_dte:
+                exit_date = current_date
+                exit_premium = current_premium
+                exit_reason = "TIME_STOP"
                 exit_price = current_price
                 break
 
@@ -287,7 +300,7 @@ def _simulate_ticker(
             entry_price=round(entry_price, 2),
             exit_price=round(exit_price, 2),
             delta_at_entry=round(delta_entry, 3),
-            iv_at_entry=round(sigma * 100, 1),
+            iv_at_entry=round(sigma_entry * 100, 1),
         )
         trades.append(trade)
         i += max(entry_frequency_days, days_held + 1)

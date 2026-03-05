@@ -92,8 +92,6 @@ def monitor_positions(
 
     try:
         # ── VIX Spike Pre-Check ───────────────────────────────────────────────
-        # Pull current VIX before checking individual positions.  If VIX is at
-        # DEFENSIVE level or above, flag all open credit spreads for review.
         _vix_spike_alerts = _check_vix_spike_for_positions(positions)
         alerts.extend(_vix_spike_alerts)
 
@@ -129,13 +127,15 @@ def _check_position(
 ) -> Optional[MonitorAlert]:
     """Check a single position for exit signals."""
 
-    # ── Expiry Check ──────────────────────────────────────────────────────────
+    # ── Expiry Check (hard expired only — EXPIRING_SOON moved below P&L) ─────
+    dte_remaining = None
     try:
         exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d").date()
         dte_remaining = (exp_date - today).days
 
         if dte_remaining <= 0:
             return MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
                 alert_type="EXPIRED",
@@ -143,7 +143,14 @@ def _check_position(
                 action="CLOSE",
                 priority=1,
             )
-        elif dte_remaining <= 5:
+    except Exception as exc:
+        logger.debug(f"Expiry parse error for {pos.ticker}: {exc}")
+
+    # ── Price-based P&L Check ──────────────────────────────────────────────────
+    current_price = _get_current_price(pos.ticker, ib_monitor)
+    if current_price is None:
+        # FIX #3: Still emit EXPIRING_SOON if we can't get a price but DTE is low
+        if dte_remaining is not None and 0 < dte_remaining <= 5:
             return MonitorAlert(
                 ticker=pos.ticker,
                 strategy=pos.strategy,
@@ -153,12 +160,6 @@ def _check_position(
                 action="REVIEW",
                 priority=2,
             )
-    except Exception as exc:
-        logger.debug(f"Expiry parse error for {pos.ticker}: {exc}")
-
-    # ── Price-based P&L Check ──────────────────────────────────────────────────
-    current_price = _get_current_price(pos.ticker, ib_monitor)
-    if current_price is None:
         return None
 
     # ── Long Option Route ─────────────────────────────────────────────────────
@@ -192,6 +193,7 @@ def _check_position(
         # Profit target: position decayed to 50% of credit
         if pnl_pct >= profit_target_pct:
             return MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
                 alert_type="PROFIT_TARGET",
@@ -212,6 +214,7 @@ def _check_position(
         loss_pct = (current_value - entry_value) / entry_value * 100
         if loss_pct >= stop_loss_pct:
             return MonitorAlert(
+                trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
                 alert_type="STOP_LOSS",
@@ -273,13 +276,26 @@ def _check_position(
                 priority=1,
             )
 
+    # FIX #3: EXPIRING_SOON check AFTER P&L checks so profit/stop alerts take priority
+    if dte_remaining is not None and 0 < dte_remaining <= 5:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="EXPIRING_SOON",
+            message=f"Only {dte_remaining} DTE remaining. Consider rolling or closing.",
+            current_price=current_price,
+            action="REVIEW",
+            priority=2,
+        )
+
     return None
 
 
 def _check_vix_spike_for_positions(positions) -> list[MonitorAlert]:
     """
     Pull current VIX; generate VIX_SPIKE alerts for open credit spreads when:
-    (a) VIX ≥ VIX_DEFENSIVE_LEVEL, or
+    (a) VIX >= VIX_DEFENSIVE_LEVEL, or
     (b) VIX spiked > VIX_SPIKE_THRESHOLD_PCT above its recent rolling average.
     """
     alerts: list[MonitorAlert] = []
@@ -288,20 +304,24 @@ def _check_vix_spike_for_positions(positions) -> list[MonitorAlert]:
         if vix_hist.empty or len(vix_hist) < 2:
             return alerts
         vix_now = round(float(vix_hist["Close"].iloc[-1]), 1)
-        window = min(VIX_SPIKE_WINDOW, len(vix_hist))
-        vix_5d = round(float(vix_hist["Close"].tail(window).mean()), 1)
+        # FIX #6: Exclude today's value from the rolling average so a spike
+        # today isn't diluted by including itself in the baseline.
+        window = min(VIX_SPIKE_WINDOW, len(vix_hist) - 1)
+        if window < 1:
+            return alerts
+        vix_prior_avg = round(float(vix_hist["Close"].iloc[-(window + 1):-1].mean()), 1)
     except Exception as exc:
         logger.warning(f"VIX fetch for spike check failed: {exc}")
         return alerts
 
-    spike_pct = (vix_now - vix_5d) / vix_5d * 100 if vix_5d > 0 else 0
+    spike_pct = (vix_now - vix_prior_avg) / vix_prior_avg * 100 if vix_prior_avg > 0 else 0
     is_spike = spike_pct > VIX_SPIKE_THRESHOLD_PCT
     is_defensive = vix_now >= VIX_DEFENSIVE_LEVEL
 
     if not is_defensive and not is_spike:
         return alerts  # nothing to flag
 
-    spike_note = f" (spike +{spike_pct:.0f}% vs 5d avg)" if is_spike else ""
+    spike_note = f" (spike +{spike_pct:.0f}% vs {window}d avg)" if is_spike else ""
     logger.warning(
         f"VIX DEFENSIVE/SPIKE: {vix_now:.1f}{spike_note} — "
         "reviewing all credit spread positions"
@@ -329,7 +349,7 @@ def _check_vix_spike_for_positions(positions) -> list[MonitorAlert]:
                 alert_type="VIX_SPIKE",
                 message=(
                     f"VIX at {vix_now:.0f}{spike_note} "
-                    f"(≥ DEFENSIVE level if applicable). "
+                    f"(>= DEFENSIVE level if applicable). "
                     f"{dte} DTE remaining. "
                     "Review: consider closing losing credit spreads."
                 ),
@@ -352,7 +372,7 @@ def _get_current_price(ticker: str, ib_monitor=None) -> Optional[float]:
             if snap and snap.get("last", 0) > 0:
                 price = float(snap["last"])
         except Exception as exc:
-            logger.debug(f"{ticker}: IBKR snapshot failed ({exc}) — falling back to yfinance")
+            logger.debug(f"{ticker}: IBKR snapshot failed ({exc}) -- falling back to yfinance")
 
     if price is not None:
         return price
@@ -372,7 +392,6 @@ def _yfinance_fallback(ticker: str) -> Optional[float]:
         return None
 
 
-
 def _check_long_option(
     pos: "OpenPosition",
     current_price: float,
@@ -384,9 +403,9 @@ def _check_long_option(
     """
     Exit rules for LONG_CALL / LONG_PUT positions.
 
-    Profit target : premium gained ≥ 100 % of entry debit (2× debit)
-    Stop loss     : premium lost   ≥  50 % of entry debit (0.5× debit)
-    Time stop     : ≤ 10 DTE remaining → close to avoid gamma/theta drain
+    Profit target : premium gained >= 100% of entry debit (2x debit)
+    Stop loss     : premium lost   >=  50% of entry debit (0.5x debit)
+    Time stop     : <= 10 DTE remaining -> close to avoid gamma/theta drain
     """
     try:
         exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d").date()
@@ -395,21 +414,7 @@ def _check_long_option(
         logger.debug(f"{pos.ticker}: expiry parse error: {exc}")
         dte_remaining = 999
 
-    # Time-stop check FIRST (most mechanical rule)
-    if 0 < dte_remaining <= time_stop_dte:
-        return MonitorAlert(
-            trade_id=getattr(pos, "trade_id", ""),
-            ticker=pos.ticker,
-            strategy=pos.strategy,
-            alert_type="TIME_STOP",
-            message=(
-                f"LONG OPTION TIME-STOP: {dte_remaining} DTE ≤ {time_stop_dte}. "
-                "Close to avoid accelerated theta decay."
-            ),
-            current_price=current_price,
-            action="CLOSE",
-            priority=1,
-        )
+    # Expired check
     if dte_remaining <= 0:
         return MonitorAlert(
             trade_id=getattr(pos, "trade_id", ""),
@@ -429,9 +434,12 @@ def _check_long_option(
         return None
 
     # Estimate current option value
-    current_option_value = _estimate_long_option_value(pos, current_price)
+    current_option_value = _estimate_long_option_value(pos, current_price, dte_remaining)
     gain = current_option_value - entry_debit
     gain_pct = gain / entry_debit * 100
+
+    # FIX #8: Check profit target and stop loss BEFORE time-stop so that
+    # a position at 9 DTE that has already hit its target gets the correct exit reason.
 
     # Profit target: +100% gain (option doubled)
     if gain_pct >= profit_target_pct:
@@ -442,7 +450,7 @@ def _check_long_option(
             alert_type="PROFIT_TARGET",
             message=(
                 f"LONG OPTION PROFIT TARGET +{gain_pct:.0f}%: "
-                f"option ≈ ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
+                f"option ~= ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
                 f"Stock at ${current_price:.2f}"
             ),
             current_price=current_price,
@@ -462,8 +470,28 @@ def _check_long_option(
             alert_type="STOP_LOSS",
             message=(
                 f"LONG OPTION STOP LOSS {gain_pct:.0f}%: "
-                f"option ≈ ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
+                f"option ~= ${current_option_value:.2f} vs debit ${entry_debit:.2f}. "
                 f"Stock at ${current_price:.2f}"
+            ),
+            current_price=current_price,
+            entry_credit=entry_debit,
+            current_spread_value=current_option_value,
+            pnl_pct=gain_pct,
+            action="CLOSE",
+            priority=1,
+        )
+
+    # Time-stop check AFTER profit/stop (FIX #8)
+    if 0 < dte_remaining <= time_stop_dte:
+        return MonitorAlert(
+            trade_id=getattr(pos, "trade_id", ""),
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            alert_type="TIME_STOP",
+            message=(
+                f"LONG OPTION TIME-STOP: {dte_remaining} DTE <= {time_stop_dte}. "
+                f"P&L: {gain_pct:+.0f}%. "
+                "Close to avoid accelerated theta decay."
             ),
             current_price=current_price,
             entry_credit=entry_debit,
@@ -476,24 +504,37 @@ def _check_long_option(
     return None
 
 
-def _estimate_long_option_value(pos: "OpenPosition", current_price: float) -> float:
+def _estimate_long_option_value(
+    pos: "OpenPosition",
+    current_price: float,
+    dte_remaining: int = -1,
+) -> float:
     """
-    Rough intrinsic + small time-value estimate for a long option.
+    Rough intrinsic + decaying time-value estimate for a long option.
     Real monitoring should use live options quotes.
     """
-    is_call = pos.strategy in ("LONG_CALL",)
-    strike = pos.short_strike if pos.short_strike > 0 else pos.long_strike
+    # FIX #1: For long options the bought strike is stored in long_strike.
+    # Fall back to short_strike only if long_strike is missing (legacy data).
+    # FIX #15: Clean up is_call comparison.
+    is_call = pos.strategy == "LONG_CALL"
+    strike = pos.long_strike if pos.long_strike > 0 else pos.short_strike
     if strike <= 0:
-        return abs(pos.net_credit)  # no strike info — return entry cost
+        return abs(pos.net_credit)  # no strike info -- return entry cost
 
     if is_call:
         intrinsic = max(current_price - strike, 0)
     else:
         intrinsic = max(strike - current_price, 0)
 
-    # Time value: rough proxy using 20% of entry debit decaying linearly
+    # FIX #2: Time value decays linearly from 20% of entry debit at open
+    # to 0 at expiration, instead of a constant 20%.
     entry_debit = abs(pos.net_credit) if pos.net_credit != 0 else pos.max_risk
-    time_val = entry_debit * 0.20
+    dte_at_entry = getattr(pos, "dte_at_entry", 0) or 35  # default if missing
+    if dte_remaining >= 0 and dte_at_entry > 0:
+        decay_fraction = max(dte_remaining / dte_at_entry, 0.0)
+    else:
+        decay_fraction = 0.5  # unknown -- assume midpoint
+    time_val = entry_debit * 0.20 * decay_fraction
     return round(intrinsic + time_val, 2)
 
 
@@ -503,7 +544,6 @@ def _estimate_debit_spread_value(pos: "OpenPosition", current_price: float) -> f
     Used for BULL_CALL_SPREAD and BEAR_PUT_SPREAD.
     """
     if pos.strategy in ("BULL_CALL_SPREAD", "BULL_CALL"):
-        # Value = max(current_price - long_strike, 0) - max(current_price - short_strike, 0)
         long_val = max(current_price - pos.long_strike, 0)
         short_val = max(current_price - pos.short_strike, 0)
         return max(round(long_val - short_val, 2), 0.01)
@@ -520,12 +560,10 @@ def _estimate_credit_spread_value(
 ) -> float:
     """
     Rough estimate of current spread value based on intrinsic value.
-    This is a proxy — real monitoring needs live options quotes.
+    This is a proxy -- real monitoring needs live options quotes.
     """
     if pos.strategy in ("BULL_PUT_SPREAD", "BULL_PUT"):
-        # Bull put: value = max(short_strike - current_price, 0) - max(long_strike - current_price, 0)
         intrinsic = max(pos.short_strike - current_price, 0) - max(pos.long_strike - current_price, 0)
-        # Add time value estimate (decays linearly — rough proxy)
         return max(round(intrinsic + pos.net_credit * 0.1, 2), 0.01)
 
     elif pos.strategy in ("BEAR_CALL_SPREAD", "BEAR_CALL"):
@@ -539,12 +577,12 @@ def _estimate_credit_spread_value(
 def format_monitor_report(alerts: list[MonitorAlert]) -> str:
     """Format alerts into a WhatsApp-friendly message."""
     if not alerts:
-        return f"OPTIONS MONITOR — {date.today()}\nAll positions nominal. No action needed."
+        return f"OPTIONS MONITOR -- {date.today()}\nAll positions nominal. No action needed."
 
-    lines = [f"OPTIONS MONITOR — {date.today()}", "ALERTS:"]
+    lines = [f"OPTIONS MONITOR -- {date.today()}", "ALERTS:"]
 
     for a in alerts:
-        emoji = "🔴" if a.priority == 1 else "🟡"
+        emoji = "X" if a.priority == 1 else "!"
         lines.append(f"\n{emoji} [{a.alert_type}] {a.ticker}")
         lines.append(f"Strategy: {a.strategy}")
         lines.append(a.message)

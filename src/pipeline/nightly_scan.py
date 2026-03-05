@@ -383,6 +383,14 @@ def run_nightly_scan(
                      (dominant_side == "PUTS" and rec.direction == "BULLISH"):
                     rec.confidence = rec.confidence * 0.85  # penalize counter-flow
 
+            # FIX #5: Apply ML confidence blending after all heuristic adjustments
+            _apply_ml_confidence(
+                rec,
+                regime_map[ticker],
+                iv_map.get(ticker),
+                rs_map.get(ticker),
+            )
+
             recommendations.append(rec)
 
     # ── VIX Tier Overlay ──────────────────────────────────────────────────────
@@ -487,6 +495,26 @@ def run_nightly_scan(
     logger.info("Step 10: Ranking picks")
     trades = _rank_trades(trades)
     top_picks = trades[:MAX_POSITIONS]
+
+    # FIX #16: Record paper trades inside run_nightly_scan() so programmatic
+    # callers (dashboard, cron) also get trade logging — not just CLI.
+    if not dry_run:
+        for pick in top_picks:
+            _rec = pick["recommendation"]
+            _trade = pick["trade"]
+            _ctx = pick["context"]
+            if not _trade.get("dry_run"):
+                try:
+                    tid = record_entry(
+                        ticker=_rec["ticker"],
+                        recommendation=_rec,
+                        trade=_trade,
+                        context=_ctx,
+                    )
+                    pick["trade_id"] = tid
+                    logger.info(f"  Paper trade logged: {tid} {_rec['ticker']} {_rec['strategy']}")
+                except Exception as e:
+                    logger.warning(f"  Paper trade logging failed for {_rec['ticker']}: {e}")
 
     # Net beta-weighted directional exposure (informational only)
     net_beta = sum(
@@ -764,7 +792,15 @@ def _build_trade_stub(rec, df, regime_map, iv_map, rs_map,
             "market_snapshot": market_snapshot,
             "regime_detail": vars(regime_map[ticker]) if ticker in regime_map else {},
             "iv_detail": vars(iv_map[ticker]) if ticker in iv_map else {},
-            "rs_detail": {},
+            # FIX #4: Include rs_detail, ta_signals, and is_long_option in dry-run stubs
+            # so the dashboard TA Signals expander and long-option info box work in dry-run.
+            "rs_detail": {
+                "rs_vs_spy": rs_map[ticker].rs_vs_spy if ticker in rs_map else None,
+                "rs_rank": rs_map[ticker].rs_rank if ticker in rs_map else None,
+                "rs_trend": rs_map[ticker].rs_trend if ticker in rs_map else None,
+            },
+            "ta_signals": getattr(regime_map.get(ticker), "ta_signals", {}) if regime_map.get(ticker) else {},
+            "is_long_option": rec.strategy.value in ("LONG_CALL", "LONG_PUT"),
         },
     }
 
