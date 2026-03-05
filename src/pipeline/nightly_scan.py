@@ -728,6 +728,28 @@ def _rank_trades(trades: list[dict]) -> list[dict]:
                 f"{current_count}/{max_same_dir} {direction} slots filled"
             )
 
+    # ── V3: Long-option allocation cap ─────────────────────────────────────
+    # No more than LONG_OPTION_MAX_ALLOCATION_PCT% of MAX_POSITIONS may be
+    # directional long options (they carry 100% premium-loss risk vs. capped
+    # spread risk, so we keep them to a minority of the book).
+    from config.settings import LONG_OPTION_MAX_ALLOCATION_PCT
+    max_long_option_slots = max(1, int(MAX_POSITIONS * LONG_OPTION_MAX_ALLOCATION_PCT / 100))
+    long_option_count = 0
+    capped: list[dict] = []
+    for t in balanced:
+        strategy = t.get("recommendation", {}).get("strategy", "")
+        if strategy in ("LONG_CALL", "LONG_PUT"):
+            if long_option_count >= max_long_option_slots:
+                ticker_name = t.get("recommendation", {}).get("ticker", "?")
+                logger.info(
+                    f"  Long-option cap: skipped {ticker_name} ({strategy}) — "
+                    f"{long_option_count}/{max_long_option_slots} long-option slots filled"
+                )
+                continue
+            long_option_count += 1
+        capped.append(t)
+    balanced = capped
+
     for i, t in enumerate(balanced):
         t["priority"] = i + 1
 

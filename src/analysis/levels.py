@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config.settings import SR_LOOKBACK_DAYS, SR_VOLUME_BINS, SR_PROXIMITY_PCT
+from config.settings import SR_LOOKBACK_DAYS, SR_VOLUME_BINS, SR_PROXIMITY_PCT, BREAKOUT_VOLUME_MULTIPLIER
 
 logger = logging.getLogger(__name__)
 
@@ -168,13 +168,13 @@ def analyze_levels(
         breakout_above = (
             price > prev_resistance and
             vol_20d_avg > 0 and
-            vol_today > vol_20d_avg * 1.5
+            vol_today > vol_20d_avg * BREAKOUT_VOLUME_MULTIPLIER
         )
 
         breakdown_below = (
             price < prev_support and
             vol_20d_avg > 0 and
-            vol_today > vol_20d_avg * 1.5
+            vol_today > vol_20d_avg * BREAKOUT_VOLUME_MULTIPLIER
         )
 
         # ── Volume Profile Skew ───────────────────────────────────────────────

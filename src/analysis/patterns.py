@@ -37,7 +37,9 @@ class PatternSignals:
     # RSI Divergence
     bullish_divergence: bool = False   # Price lower low, RSI higher low
     bearish_divergence: bool = False   # Price higher high, RSI lower high
-    divergence_strength: float = 0.0   # 0-1 magnitude of the divergence
+    divergence_strength: float = 0.0        # 0-1 magnitude (kept for backwards-compat)
+    bullish_divergence_strength: float = 0.0  # 0-1 magnitude of bullish divergence
+    bearish_divergence_strength: float = 0.0  # 0-1 magnitude of bearish divergence
 
     # Inside Bar (consolidation → breakout imminent)
     inside_bar: bool = False           # Today's range contained within yesterday's
@@ -88,9 +90,9 @@ def detect_patterns(
         if rsi is not None and len(rsi.dropna()) >= divergence_lookback:
             _detect_divergence(signals, close, rsi, divergence_lookback)
             if signals.bullish_divergence:
-                score += 0.25 * (1 + signals.divergence_strength)
+                score += 0.25 * (1 + signals.bullish_divergence_strength)
             if signals.bearish_divergence:
-                score -= 0.25 * (1 + signals.divergence_strength)
+                score -= 0.25 * (1 + signals.bearish_divergence_strength)
 
         # ── Inside Bar ────────────────────────────────────────────────────────
         if len(high) >= 2 and len(low) >= 2:
@@ -214,17 +216,17 @@ def _detect_divergence(
     if price_second_low < price_first_low and rsi_second_low > rsi_first_low:
         signals.bullish_divergence = True
         if rsi_range > 0:
-            signals.divergence_strength = round(
-                abs(rsi_second_low - rsi_first_low) / rsi_range, 3
-            )
+            strength = round(abs(rsi_second_low - rsi_first_low) / rsi_range, 3)
+            signals.bullish_divergence_strength = strength
+            signals.divergence_strength = strength  # backwards-compat
 
     # Bearish: price higher high + RSI lower high
     if price_second_high > price_first_high and rsi_second_high < rsi_first_high:
         signals.bearish_divergence = True
         if rsi_range > 0:
-            signals.divergence_strength = round(
-                abs(rsi_first_high - rsi_second_high) / rsi_range, 3
-            )
+            strength = round(abs(rsi_first_high - rsi_second_high) / rsi_range, 3)
+            signals.bearish_divergence_strength = strength
+            signals.divergence_strength = strength  # backwards-compat
 
 
 def _compute_anchored_vwap(

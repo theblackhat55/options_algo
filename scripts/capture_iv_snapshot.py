@@ -54,7 +54,7 @@ SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 DTE_MIN = 20
 DTE_MAX = 45
 MAX_RETRIES = 2
-RATE_LIMIT_PAUSE = 0.15   # seconds between Polygon calls
+RATE_LIMIT_PAUSE = 13.0   # seconds between tickers (Polygon Starter: 5 req/min)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -166,6 +166,10 @@ def _from_polygon(ticker: str, today: str) -> dict | None:
     }
 
     resp = requests.get(url, params=params, timeout=15)
+    if resp.status_code == 429:
+        logger.warning(f"  {ticker}: Polygon rate limited (calls), waiting 60s")
+        time.sleep(60)
+        resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json().get("results", [])
 
@@ -175,6 +179,10 @@ def _from_polygon(ticker: str, today: str) -> dict | None:
     # Get spot price
     spot_url = f"https://api.polygon.io/v2/last/trade/{ticker}"
     spot_resp = requests.get(spot_url, params={"apiKey": POLYGON_API_KEY}, timeout=10)
+    if spot_resp.status_code == 429:
+        logger.warning(f"  {ticker}: Polygon rate limited (spot), waiting 60s")
+        time.sleep(60)
+        spot_resp = requests.get(spot_url, params={"apiKey": POLYGON_API_KEY}, timeout=10)
     spot_price = None
     if spot_resp.ok:
         spot_price = spot_resp.json().get("results", {}).get("p")
@@ -187,7 +195,6 @@ def _from_polygon(ticker: str, today: str) -> dict | None:
         iv      = c.get("implied_volatility", 0)
         if iv and iv > 0:
             row_iv = iv * 100 if iv < 1 else iv
-            contract_type = details.get("contract_type", "call")
             oi = day.get("open_interest", 0) or c.get("open_interest", 0)
             vol = day.get("volume", 0) or 0
             calls.append({"iv": row_iv, "strike": details.get("strike_price", 0), "oi": oi, "vol": vol})
@@ -196,6 +203,10 @@ def _from_polygon(ticker: str, today: str) -> dict | None:
     params["contract_type"] = "put"
     time.sleep(0.12)
     resp2 = requests.get(url, params=params, timeout=15)
+    if resp2.status_code == 429:
+        logger.warning(f"  {ticker}: Polygon rate limited (puts), waiting 60s")
+        time.sleep(60)
+        resp2 = requests.get(url, params=params, timeout=15)
     if resp2.ok:
         for c in resp2.json().get("results", []):
             iv = c.get("implied_volatility", 0)
@@ -210,8 +221,7 @@ def _from_polygon(ticker: str, today: str) -> dict | None:
     if not calls:
         return None
 
-    call_ivs = [c["iv"] for c in calls]
-    put_ivs  = [p["iv"] for p in puts] if puts else call_ivs
+
     all_oi   = [c["oi"] for c in calls + puts if c["oi"] > 0]
     all_vol  = [c["vol"] for c in calls + puts if c["vol"] > 0]
 
@@ -373,7 +383,11 @@ def _atm_iv(contracts: list[dict], spot: float | None) -> float:
 
 
 def _append_row(snap_file: Path, row: dict) -> None:
-    """Append a new row to the per-ticker Parquet file."""
+    """Append a new row to the per-ticker Parquet file (atomic write)."""
+    import os
+    import tempfile
+    import shutil
+
     new_df = pd.DataFrame([row]).set_index("date")
     new_df.index = pd.to_datetime(new_df.index)
 
@@ -388,7 +402,19 @@ def _append_row(snap_file: Path, row: dict) -> None:
     else:
         combined = new_df
 
-    combined.to_parquet(snap_file)
+    # Atomic write: write to a temp file then rename to avoid corruption
+    # if the process is killed mid-write.
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet", dir=snap_file.parent)
+    os.close(tmp_fd)
+    try:
+        combined.to_parquet(tmp_path)
+        shutil.move(tmp_path, str(snap_file))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     logger.debug(f"  Saved {snap_file.name} ({len(combined)} rows)")
 
 
