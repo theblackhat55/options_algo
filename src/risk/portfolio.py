@@ -34,7 +34,7 @@ class OpenPosition:
     contracts: int
     net_credit: float         # Per contract (positive = credit)
     max_risk: float           # Per contract
-    total_risk: float         # contracts × max_risk × 100
+    total_risk: float         # contracts x max_risk x 100
     short_strike: float = 0.0
     long_strike: float = 0.0
     body_strike: float = 0.0   # For butterflies
@@ -102,29 +102,51 @@ def close_position(
     strategy: str,
     close_price: float,
     close_date: str = None,
+    trade_id: str = "",
 ) -> Optional[OpenPosition]:
-    """Mark a position as closed and record P&L."""
+    """
+    Mark a position as closed and record P&L.
+
+    FIX #17: Prefer matching on trade_id (unique) when provided.
+    Falls back to ticker+strategy match for backwards compatibility,
+    but only closes the FIRST matching open position.
+    """
     if close_date is None:
         close_date = datetime.now().date().isoformat()
 
     positions = load_positions()
-    for pos in positions:
-        if pos.ticker == ticker and pos.strategy == strategy and pos.status == "OPEN":
-            pos.status = "CLOSED"
-            pos.close_price = close_price
-            pos.close_date = close_date
-            # P&L for credit spreads: net_credit − close_price
-            if pos.net_credit > 0:
-                pos.pnl = round((pos.net_credit - close_price) * pos.contracts * 100, 2)
-            else:
-                # Debit spread: close_price − abs(net_credit)
-                pos.pnl = round((close_price - abs(pos.net_credit)) * pos.contracts * 100, 2)
-            save_positions(positions)
-            logger.info(f"Closed {ticker} {strategy}: P&L ${pos.pnl:+.2f}")
-            return pos
+    target = None
 
-    logger.warning(f"No open position found for {ticker} {strategy}")
-    return None
+    # Preferred: match by trade_id if provided
+    if trade_id:
+        for pos in positions:
+            if pos.trade_id == trade_id and pos.status == "OPEN":
+                target = pos
+                break
+
+    # Fallback: match by ticker + strategy (legacy behavior)
+    if target is None:
+        for pos in positions:
+            if pos.ticker == ticker and pos.strategy == strategy and pos.status == "OPEN":
+                target = pos
+                break
+
+    if target is None:
+        logger.warning(f"No open position found for {ticker} {strategy} (trade_id={trade_id})")
+        return None
+
+    target.status = "CLOSED"
+    target.close_price = close_price
+    target.close_date = close_date
+    # P&L for credit spreads: net_credit - close_price
+    if target.net_credit > 0:
+        target.pnl = round((target.net_credit - close_price) * target.contracts * 100, 2)
+    else:
+        # Debit spread / long option: close_price - abs(net_credit)
+        target.pnl = round((close_price - abs(target.net_credit)) * target.contracts * 100, 2)
+    save_positions(positions)
+    logger.info(f"Closed {ticker} {strategy} (id={target.trade_id}): P&L ${target.pnl:+.2f}")
+    return target
 
 
 def check_portfolio_limits(
@@ -147,12 +169,10 @@ def check_portfolio_limits(
 
     can_add = (
         len(open_pos) < MAX_POSITIONS and
-        total_risk < max_allowed_risk * 0.9  # 90% of max before blocking
+        total_risk < max_allowed_risk * 0.9
     )
 
-    # Directional exposure check: don't pile into one direction
     if new_ticker:
-        # Could add sector correlation check here
         pass
 
     remaining = round(max_allowed_risk - total_risk, 2)

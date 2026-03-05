@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -154,7 +154,7 @@ def format_morning_brief(signal: dict = None) -> str:
         picks, ibkr_note = _enrich_picks_live(picks)
         signal["top_picks"] = picks
         signal["ibkr_live_enrichment"] = ibkr_note
-        signal["ibkr_enriched_at"] = datetime.utcnow().isoformat()
+        signal["ibkr_enriched_at"] = datetime.now(timezone.utc).isoformat()
         # Save enriched signal back to disk so dashboard reflects live data
         _save_enriched_signal(signal)
 
@@ -298,7 +298,7 @@ def format_morning_brief(signal: dict = None) -> str:
 def _save_enriched_signal(signal: dict) -> None:
     """Save the IBKR-enriched signal back to disk (overwrites latest + dated file)."""
     try:
-        scan_date = signal.get("scan_date", datetime.utcnow().date().isoformat())
+        scan_date = signal.get("scan_date", datetime.now(timezone.utc).date().isoformat())
         for path in [
             SIGNALS_DIR / "options_signal_latest.json",
             SIGNALS_DIR / f"options_signal_{scan_date}.json",
