@@ -21,9 +21,11 @@ from typing import Optional
 import numpy as np
 from scipy.stats import norm
 
+from config.settings import RISK_FREE_RATE  # P2 FIX #8: now configurable via .env
+
 logger = logging.getLogger(__name__)
 
-RISK_FREE_RATE = 0.053   # ~5.3% (update periodically to current T-bill rate)
+# RISK_FREE_RATE is imported from config.settings (set via RISK_FREE_RATE env var)
 
 
 # ─── Black-Scholes Greeks ─────────────────────────────────────────────────────

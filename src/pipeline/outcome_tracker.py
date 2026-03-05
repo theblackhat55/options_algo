@@ -9,6 +9,7 @@ Usage:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import uuid
@@ -208,9 +209,19 @@ def record_exit(
                 # Debit spread: profit = exit_price − |debit|
                 out.pnl = round((exit_price - abs(out.net_credit_or_debit)), 2)
 
-            # P&L as % of max profit
-            max_profit = abs(out.net_credit_or_debit) if out.net_credit_or_debit > 0 else out.max_risk
-            out.pnl_pct = round(out.pnl / max_profit * 100 if max_profit > 0 else 0, 1)
+            # P&L as % of max risk (standardized across all strategy types).
+            # max_risk is always the maximum dollar amount the trade can lose:
+            #   credit spreads : spread_width - credit (stored as out.max_risk)
+            #   debit spreads  : debit paid (= |net_credit_or_debit|)
+            #   long options   : premium paid (= |net_credit_or_debit|)
+            # This gives a consistent scale for model training and reporting.
+            if out.net_credit_or_debit > 0:
+                # Credit spread — max_risk is the risk side of the spread
+                denom = out.max_risk if out.max_risk and out.max_risk > 0 else abs(out.net_credit_or_debit)
+            else:
+                # Debit spread or long option — max_risk = debit paid
+                denom = abs(out.net_credit_or_debit) if abs(out.net_credit_or_debit) > 0 else out.max_risk
+            out.pnl_pct = round(out.pnl / denom * 100 if denom and denom > 0 else 0, 1)
 
             out.won = out.pnl > 0
             out.outcome = "WIN" if out.won else "LOSS"
@@ -272,35 +283,47 @@ def get_win_rate(strategy: str = None) -> dict:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _append_outcome(outcome: TradeOutcome) -> None:
-    """Append a single trade outcome to JSONL file."""
+    """Append a single trade outcome to JSONL file (exclusive lock)."""
     try:
         with open(_OUTCOMES_FILE, "a") as f:
-            f.write(json.dumps(asdict(outcome)) + "\n")
+            fcntl.flock(f, fcntl.LOCK_EX)  # P2 FIX #7
+            try:
+                f.write(json.dumps(asdict(outcome)) + "\n")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as exc:
         logger.error(f"Failed to append outcome: {exc}")
 
 
 def _load_all_outcomes() -> list[TradeOutcome]:
-    """Load all trade outcomes from JSONL file."""
+    """Load all trade outcomes from JSONL file (shared lock)."""
     if not _OUTCOMES_FILE.exists():
         return []
     outcomes = []
     try:
         with open(_OUTCOMES_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    outcomes.append(TradeOutcome(**json.loads(line)))
+            fcntl.flock(f, fcntl.LOCK_SH)  # P2 FIX #7
+            try:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        outcomes.append(TradeOutcome(**json.loads(line)))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as exc:
         logger.warning(f"Failed to load outcomes: {exc}")
     return outcomes
 
 
 def _save_all_outcomes(outcomes: list[TradeOutcome]) -> None:
-    """Rewrite the entire JSONL file (used after updates)."""
+    """Rewrite the entire JSONL file (exclusive lock)."""
     try:
         with open(_OUTCOMES_FILE, "w") as f:
-            for o in outcomes:
-                f.write(json.dumps(asdict(o)) + "\n")
+            fcntl.flock(f, fcntl.LOCK_EX)  # P2 FIX #7
+            try:
+                for o in outcomes:
+                    f.write(json.dumps(asdict(o)) + "\n")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as exc:
         logger.error(f"Failed to save outcomes: {exc}")

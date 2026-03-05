@@ -9,14 +9,16 @@ Usage:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from config.settings import MAX_POSITIONS, TRADES_DIR
+from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT, TRADES_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +62,16 @@ class PortfolioRisk:
 
 
 def load_positions() -> list[OpenPosition]:
-    """Load open positions from JSON file."""
+    """Load open positions from JSON file (shared-lock for concurrent readers)."""
     if not _POSITIONS_FILE.exists():
         return []
     try:
         with open(_POSITIONS_FILE) as f:
-            raw = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_SH)  # P2 FIX #7: shared read lock
+            try:
+                raw = json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
         return [OpenPosition(**p) for p in raw]
     except Exception as exc:
         logger.warning(f"Failed to load positions: {exc}")
@@ -73,11 +79,15 @@ def load_positions() -> list[OpenPosition]:
 
 
 def save_positions(positions: list[OpenPosition]) -> None:
-    """Persist positions to JSON."""
+    """Persist positions to JSON (exclusive lock to prevent concurrent writes)."""
     try:
         data = [vars(p) for p in positions]
         with open(_POSITIONS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+            fcntl.flock(f, fcntl.LOCK_EX)  # P2 FIX #7: exclusive write lock
+            try:
+                json.dump(data, f, indent=2)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as exc:
         logger.error(f"Failed to save positions: {exc}")
 
@@ -177,13 +187,16 @@ def check_portfolio_limits(
 
     remaining = round(max_allowed_risk - total_risk, 2)
 
+    # P3 FIX #13: derive directional warning threshold from MAX_SAME_DIRECTION_PCT
+    # (default 60% of MAX_POSITIONS) instead of a hard-coded literal of 3.
+    _directional_limit = max(1, round(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
     notes = []
     if len(open_pos) >= MAX_POSITIONS:
         notes.append(f"Max positions reached ({MAX_POSITIONS})")
-    if bullish > 3:
-        notes.append("Heavy bullish exposure")
-    if bearish > 3:
-        notes.append("Heavy bearish exposure")
+    if bullish > _directional_limit:
+        notes.append(f"Heavy bullish exposure ({bullish}/{MAX_POSITIONS} positions)")
+    if bearish > _directional_limit:
+        notes.append(f"Heavy bearish exposure ({bearish}/{MAX_POSITIONS} positions)")
 
     return PortfolioRisk(
         open_positions=open_pos,

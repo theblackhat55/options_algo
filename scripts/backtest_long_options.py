@@ -177,7 +177,7 @@ def _simulate_ticker(
         log_returns = np.diff(np.log(prices[max(0, i - 22):i + 1]))
         sigma_entry = float(np.std(log_returns) * np.sqrt(252)) if len(log_returns) > 2 else 0.30
 
-        T = target_dte / 252.0
+        T = target_dte / 365.0  # P3 FIX #10: calendar-day convention (365) not trading-day (252)
 
         # FIX #18: Strike candidates scale with stock price instead of fixed $5
         step = max(1.0, round(entry_price * 0.01 / 2.5) * 2.5)  # ~1% of price, rounded to $2.50
@@ -234,7 +234,7 @@ def _simulate_ticker(
             current_date = dates_idx[j].date()
             dte_now = (expiry_date - current_date).days
 
-            T_now = max(dte_now / 252.0, 1e-6)
+            T_now = max(dte_now / 365.0, 1e-6)  # P3 FIX #10: calendar-day convention
 
             # FIX #7: Recompute sigma from rolling 20-day HV at each step
             # instead of using constant entry sigma throughout the trade.

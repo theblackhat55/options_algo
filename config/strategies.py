@@ -13,6 +13,8 @@ from config.settings import (
     DEFAULT_DTE_BUTTERFLY, DEFAULT_DTE_IC,
     DEFAULT_SPREAD_WIDTH, DEFAULT_SHORT_DELTA,
     IC_WING_DELTA, PROFIT_TARGET_PCT, STOP_LOSS_PCT,
+    DEFAULT_DTE_LONG_OPTION, LONG_OPTION_DELTA,
+    LONG_OPTION_PROFIT_TARGET_PCT, LONG_OPTION_STOP_LOSS_PCT,
 )
 
 
@@ -106,6 +108,29 @@ STRATEGY_CONFIGS: dict[str, StrategyConfig] = {
         min_rr_ratio=3.0,                   # Butterflies need good R/R
         notes="Use in range-bound + low IV + Bollinger squeeze. "
               "Buy 1 ATM call, sell 2 OTM calls, buy 1 further OTM call.",
+    ),
+    # P2 FIX #9: add LONG_CALL and LONG_PUT entries so get_strategy_config() works
+    "LONG_CALL": StrategyConfig(
+        name="LONG_CALL",
+        display_name="Long Call",
+        category="debit",
+        default_dte=DEFAULT_DTE_LONG_OPTION,
+        target_short_delta=LONG_OPTION_DELTA,   # 0.65 delta (in-the-money)
+        spread_width=0.0,                       # single-leg, no spread
+        profit_target_pct=LONG_OPTION_PROFIT_TARGET_PCT,   # 100%
+        stop_loss_pct=LONG_OPTION_STOP_LOSS_PCT,           # 50%
+        notes="Long ITM call for bullish directional. Low IV rank only (<40%).",
+    ),
+    "LONG_PUT": StrategyConfig(
+        name="LONG_PUT",
+        display_name="Long Put",
+        category="debit",
+        default_dte=DEFAULT_DTE_LONG_OPTION,
+        target_short_delta=LONG_OPTION_DELTA,   # 0.65 delta
+        spread_width=0.0,
+        profit_target_pct=LONG_OPTION_PROFIT_TARGET_PCT,
+        stop_loss_pct=LONG_OPTION_STOP_LOSS_PCT,
+        notes="Long ITM put for bearish directional. Low IV rank only (<40%).",
     ),
 }
 
