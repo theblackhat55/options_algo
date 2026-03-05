@@ -167,17 +167,9 @@ def _check_position(
     if is_long:
         alert = _check_long_option(pos, current_price, today)
         if alert:
-            # Auto-close: record exit in outcome_tracker
-            if alert.action == "CLOSE" and getattr(pos, "trade_id", ""):
-                try:
-                    record_exit(
-                        pos.trade_id,
-                        exit_price=alert.current_spread_value,
-                        close_reason=alert.alert_type,
-                    )
-                    logger.info(f"Auto-closed long option {pos.ticker} [{alert.alert_type}]")
-                except Exception as exc:
-                    logger.warning(f"Auto-close record_exit failed for {pos.ticker}: {exc}")
+            # P0 FIX #2: record exit AND close position for ALL auto-close events
+            if alert.action == "CLOSE":
+                _auto_close_position(pos, alert)
         return alert
 
     # For credit spreads: estimate current spread value from intrinsic value
@@ -192,7 +184,7 @@ def _check_position(
 
         # Profit target: position decayed to 50% of credit
         if pnl_pct >= profit_target_pct:
-            return MonitorAlert(
+            _alert = MonitorAlert(
                 trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
@@ -209,11 +201,13 @@ def _check_position(
                 action="CLOSE",
                 priority=1,
             )
+            _auto_close_position(pos, _alert)  # P0 FIX #2
+            return _alert
 
         # Stop loss: spread expanded to 2x credit received
         loss_pct = (current_value - entry_value) / entry_value * 100
         if loss_pct >= stop_loss_pct:
-            return MonitorAlert(
+            _alert = MonitorAlert(
                 trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
@@ -231,6 +225,8 @@ def _check_position(
                 action="CLOSE",
                 priority=1,
             )
+            _auto_close_position(pos, _alert)  # P0 FIX #2
+            return _alert
 
     # Debit spread: estimate value and compare to entry debit
     if pos.net_credit < 0:
@@ -240,7 +236,7 @@ def _check_position(
         loss_pct = -gain_pct
 
         if gain_pct >= profit_target_pct:
-            return MonitorAlert(
+            _alert = MonitorAlert(
                 trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
@@ -257,8 +253,10 @@ def _check_position(
                 action="CLOSE",
                 priority=1,
             )
+            _auto_close_position(pos, _alert)  # P0 FIX #2
+            return _alert
         if loss_pct >= stop_loss_pct:
-            return MonitorAlert(
+            _alert = MonitorAlert(
                 trade_id=getattr(pos, "trade_id", ""),
                 ticker=pos.ticker,
                 strategy=pos.strategy,
@@ -275,6 +273,8 @@ def _check_position(
                 action="CLOSE",
                 priority=1,
             )
+            _auto_close_position(pos, _alert)  # P0 FIX #2
+            return _alert
 
     # FIX #3: EXPIRING_SOON check AFTER P&L checks so profit/stop alerts take priority
     if dte_remaining is not None and 0 < dte_remaining <= 5:
@@ -572,6 +572,40 @@ def _estimate_credit_spread_value(
 
     # Default: return entry credit (no information)
     return pos.net_credit
+
+
+def _auto_close_position(pos: "OpenPosition", alert: "MonitorAlert") -> None:
+    """
+    P0 FIX #2 helper: atomically record the exit in outcome_tracker AND
+    call close_position() in portfolio so the position is marked CLOSED.
+    Called for every alert with action=="CLOSE" regardless of strategy type.
+    """
+    trade_id = getattr(pos, "trade_id", "")
+    exit_price = getattr(alert, "current_spread_value", 0.0) or 0.0
+    close_reason = getattr(alert, "alert_type", "MONITOR_AUTO_CLOSE")
+
+    # 1. Record the exit in outcome_tracker (updates JSONL with P&L)
+    if trade_id:
+        try:
+            record_exit(trade_id, exit_price=exit_price, close_reason=close_reason)
+            logger.info(
+                f"Auto-closed {pos.ticker} [{close_reason}]: "
+                f"trade_id={trade_id} exit=${exit_price:.2f}"
+            )
+        except Exception as exc:
+            logger.warning(f"record_exit failed for {pos.ticker} ({trade_id}): {exc}")
+
+    # 2. Mark position as CLOSED in portfolio (removes from open positions)
+    try:
+        close_position(
+            ticker=pos.ticker,
+            strategy=pos.strategy,
+            exit_price=exit_price,
+            trade_id=trade_id or None,
+        )
+        logger.info(f"Portfolio position closed for {pos.ticker} via monitor")
+    except Exception as exc:
+        logger.warning(f"close_position failed for {pos.ticker}: {exc}")
 
 
 def format_monitor_report(alerts: list[MonitorAlert]) -> str:

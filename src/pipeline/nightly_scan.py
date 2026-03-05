@@ -39,6 +39,7 @@ from config.settings import (
     MIN_STOCK_PRICE, MIN_AVG_VOLUME, LOG_LEVEL,
     VIX_CAUTION_LEVEL, VIX_DEFENSIVE_LEVEL, VIX_LIQUIDATION_LEVEL,
     MAX_PER_SECTOR, SPY_DIRECTIONAL_GATE_PCT, IBKR_ENABLED,
+    LONG_OPTION_MIN_CONFIDENCE,
 )
 from config.universe import get_universe, get_sector, get_tradeable_universe
 
@@ -390,6 +391,24 @@ def run_nightly_scan(
                 iv_map.get(ticker),
                 rs_map.get(ticker),
             )
+
+            # P1 FIX #5b: After ML blending, re-enforce LONG_OPTION_MIN_CONFIDENCE.
+            # ML may lower confidence below the minimum threshold for long options;
+            # downgrade back to the base spread strategy in that case.
+            if rec.strategy.value in ("LONG_CALL", "LONG_PUT") and \
+                    rec.confidence < LONG_OPTION_MIN_CONFIDENCE:
+                original_strat = (
+                    StrategyType.BULL_CALL_SPREAD
+                    if rec.strategy == StrategyType.LONG_CALL
+                    else StrategyType.BEAR_PUT_SPREAD
+                )
+                logger.debug(
+                    f"  {ticker}: ML blended confidence {rec.confidence:.2%} < "
+                    f"{LONG_OPTION_MIN_CONFIDENCE:.0%} — downgrading "
+                    f"{rec.strategy.value} → {original_strat.value}"
+                )
+                rec.strategy = original_strat
+                rec.rationale = rec.rationale.replace("⬆ Upgraded to long option", "").strip(" | ")
 
             recommendations.append(rec)
 
@@ -930,16 +949,8 @@ if __name__ == "__main__":
                 print(f"   Credit: ${credit} | Max Risk: ${max_r} | PoP: {pop}%")
         print(f"   {rec['rationale']}")
 
-        # Log paper trade
-        if not trade.get("dry_run"):
-            try:
-                tid = record_entry(
-                    ticker=rec["ticker"],
-                    recommendation=rec,
-                    trade=trade,
-                    context=ctx,
-                )
-                print(f"   📝 Trade logged: {tid}")
-            except Exception as e:
-                print(f"   ⚠️ Trade logging failed: {e}")
+        # Trade logging already handled inside run_nightly_scan() — P0 FIX #1:
+        # avoid double record_entry when running from CLI.
+        if not trade.get("dry_run") and pick.get("trade_id"):
+            print(f"   📝 Trade logged: {pick['trade_id']}")
     print()

@@ -170,6 +170,12 @@ LONG_OPTION_MAX_ALLOCATION_PCT = float(os.getenv("LONG_OPTION_MAX_ALLOCATION_PCT
 # IV Rank ceiling — never buy premium when IV rank is above this
 LONG_OPTION_IV_RANK_CEILING = float(os.getenv("LONG_OPTION_IV_RANK_CEILING", "40"))
 
+# ─── Options Analytics ────────────────────────────────────────────────────────
+# Risk-free rate used in Black-Scholes pricing (update to current T-bill rate)
+# P2 FIX #8: configurable via .env so it can be updated without code changes
+RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.053"))   # default ~5.3%
+
+
 # ─── Technical Analysis Parameters (V3) ──────────────────────────────────────
 # Support/Resistance: lookback period for volume-profile pivot detection
 SR_LOOKBACK_DAYS = int(os.getenv("SR_LOOKBACK_DAYS", "60"))

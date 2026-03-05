@@ -33,7 +33,17 @@ def get_earnings_dates(ticker: str, days_ahead: int = 60) -> list[date]:
     Uses Finnhub with local JSON cache.
     """
     cache = _load_cache()
-    cache_key = f"{ticker}_{date.today().isoformat()}"
+    today_str = date.today().isoformat()
+    cache_key = f"{ticker}_{today_str}"
+
+    # P3 FIX #12: Prune stale entries (keys not matching today's date) to prevent
+    # unbounded cache growth when the scanner runs daily.
+    stale_keys = [k for k in list(cache.keys()) if not k.endswith(f"_{today_str}")]
+    if stale_keys:
+        for k in stale_keys:
+            del cache[k]
+        logger.debug(f"Pruned {len(stale_keys)} stale earnings cache entries")
+        _save_cache(cache)
 
     if cache_key in cache:
         return [datetime.strptime(d, "%Y-%m-%d").date() for d in cache[cache_key]]

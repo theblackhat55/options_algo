@@ -247,8 +247,8 @@ def format_morning_brief(signal: dict = None) -> str:
         if not trade.get("dry_run"):
             lines.append(_format_trade(trade, rec.get("strategy", "")))
 
-            # TA-signal one-liner
-            ta_sigs = rec.get("ta_signals") or {}
+            # TA-signal one-liner — ta_signals lives on the trade stub (FIX #P1)
+            ta_sigs = trade.get("ta_signals") or rec.get("ta_signals") or {}
             ta_parts = []
             if ta_sigs.get("breakout_above"):
                 ta_parts.append("⬆ breakout")

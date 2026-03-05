@@ -199,10 +199,10 @@ def analyze_iv(
         iv_history_series, iv_is_proxy = _load_iv_snapshot_history(
             ticker, close
         )
-        # Recheck proxy flag: if we got real snapshot data, iv_is_proxy stays False
-        # only if the snapshot was used AND the spot current_iv was from options chain
-        if iv_is_proxy and not iv_is_proxy:
-            iv_is_proxy = True   # keep existing proxy flag from spot IV logic above
+        # Recheck proxy flag: _load_iv_snapshot_history returns (series, is_proxy).
+        # If real snapshot data was available, iv_is_proxy is already correctly set
+        # to False by that call.  The previous spot-IV proxy flag is superseded.
+        # (FIX P1: removed tautological `if iv_is_proxy and not iv_is_proxy` dead code)
 
         # ── IV Rank / Percentile ──────────────────────────────────────────────
         iv_rank = compute_iv_rank(iv_history_series, IV_LOOKBACK_DAYS)
