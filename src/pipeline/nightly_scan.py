@@ -49,6 +49,8 @@ from src.data.market_context import get_market_context
 from src.analysis.technical import classify_universe, Regime, get_regime_summary
 from src.analysis.volatility import analyze_iv
 from src.analysis.relative_strength import rank_universe_rs
+from src.analysis.levels import analyze_universe_levels
+from src.analysis.patterns import detect_universe_patterns
 
 from src.strategy.selector import select_strategy, StrategyType
 from src.strategy.credit_spread import construct_bull_put_spread, construct_bear_call_spread
@@ -56,6 +58,8 @@ from src.strategy.bull_call_spread import construct_bull_call_spread
 from src.strategy.bear_put_spread import construct_bear_put_spread
 from src.strategy.iron_condor import construct_iron_condor
 from src.strategy.butterfly import construct_long_butterfly
+from src.strategy.long_call import construct_long_call
+from src.strategy.long_put import construct_long_put
 
 from src.risk.event_filter import filter_safe_tickers
 
@@ -166,6 +170,58 @@ def run_nightly_scan(
     regime_map = {r.ticker: r for r in regimes}
     regime_dist = get_regime_summary(regimes)
     logger.info(f"  Distribution: {regime_dist}")
+
+    # ── Step 4b: TA Signals (levels + patterns) ────────────────────────────────
+    logger.info("Step 4b: Computing TA signals (S/R levels + pattern detection)")
+    try:
+        level_map = analyze_universe_levels(qualified)
+        pattern_map = detect_universe_patterns(qualified)
+
+        ta_enriched = 0
+        for ticker, regime in regime_map.items():
+            signals: dict = {}
+
+            # Attach level analysis
+            la = level_map.get(ticker)
+            if la is not None:
+                signals.update({
+                    "breakout_above": la.breakout_above,
+                    "breakdown_below": la.breakdown_below,
+                    "near_support": la.near_support,
+                    "near_resistance": la.near_resistance,
+                    "support_distance_pct": la.support_distance_pct,
+                    "resistance_distance_pct": la.resistance_distance_pct,
+                    "volume_profile_skew": la.volume_profile_skew,
+                    "high_volume_node": la.high_volume_node,
+                })
+
+            # Attach pattern signals
+            ps = pattern_map.get(ticker)
+            if ps is not None:
+                signals.update({
+                    "bullish_divergence": ps.bullish_divergence,
+                    "bearish_divergence": ps.bearish_divergence,
+                    "divergence_strength": ps.divergence_strength,
+                    "squeeze_fired": ps.squeeze_fired,
+                    "squeeze_direction": ps.squeeze_direction,
+                    "volume_climax": ps.volume_climax,
+                    "climax_direction": ps.climax_direction,
+                    "inside_bar": ps.inside_bar,
+                    "above_anchored_vwap": ps.above_anchored_vwap,
+                    "below_anchored_vwap": ps.below_anchored_vwap,
+                    "pattern_score": ps.pattern_score,
+                })
+
+            if signals:
+                regime.ta_signals = signals
+                ta_enriched += 1
+
+        logger.info(
+            f"  TA signals: {ta_enriched} tickers enriched "
+            f"({len(level_map)} levels, {len(pattern_map)} patterns)"
+        )
+    except Exception as exc:
+        logger.warning(f"  Step 4b TA signals failed (non-fatal): {exc}")
 
     # ── Step 5: Relative Strength ──────────────────────────────────────────────
     logger.info("Step 5: Computing relative strength")
@@ -484,6 +540,16 @@ def _construct_trade(rec, ticker, price, chain):
     elif strategy == StrategyType.LONG_BUTTERFLY:
         return construct_long_butterfly(ticker, price, chain, target_dte=dte)
 
+    elif strategy == StrategyType.LONG_CALL:
+        from config.settings import DEFAULT_DTE_LONG_OPTION
+        return construct_long_call(ticker, price, chain,
+                                   target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
+
+    elif strategy == StrategyType.LONG_PUT:
+        from config.settings import DEFAULT_DTE_LONG_OPTION
+        return construct_long_put(ticker, price, chain,
+                                  target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
+
     return None
 
 
@@ -563,6 +629,10 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "rs_rank": rs.rs_rank if rs else None,
                 "rs_trend": rs.rs_trend if rs else None,
             },
+            # ── V3: TA signals from levels + patterns ────────────────────────────────
+            "ta_signals": getattr(regime, "ta_signals", {}),
+            # ── V3: Long option metadata ─────────────────────────────────────────
+            "is_long_option": rec.strategy.value in ("LONG_CALL", "LONG_PUT"),
         },
     }
 

@@ -41,7 +41,12 @@ from typing import Optional
 
 from src.analysis.technical import Regime, StockRegime
 from src.analysis.volatility import IVAnalysis
-from config.settings import SPY_DIRECTIONAL_GATE_PCT
+from config.settings import (
+    SPY_DIRECTIONAL_GATE_PCT,
+    DEFAULT_DTE_LONG_OPTION,
+    LONG_OPTION_IV_RANK_CEILING,
+    LONG_OPTION_MIN_CONFIDENCE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,8 @@ class StrategyType(str, Enum):
     BEAR_CALL_SPREAD  = "BEAR_CALL_SPREAD"   # Credit spread — bearish
     IRON_CONDOR       = "IRON_CONDOR"
     LONG_BUTTERFLY    = "LONG_BUTTERFLY"
+    LONG_CALL         = "LONG_CALL"          # V3: long call (LOW IV only)
+    LONG_PUT          = "LONG_PUT"           # V3: long put  (LOW IV only)
     SKIP              = "SKIP"
 
 
@@ -242,8 +249,81 @@ def select_strategy(
     else:
         target_dte = _DTE_MAP.get(risk_reward, 30)
 
+    # ── V3: Long Option Upgrade Path ─────────────────────────────────────────
+    # When IV rank is LOW and the trend is STRONG, upgrade a debit spread to a
+    # naked long option — more upside, simpler execution.  Fires only when:
+    #   1. IV rank <= LONG_OPTION_IV_RANK_CEILING (cheap premium)
+    #   2. Regime is STRONG_UPTREND, STRONG_DOWNTREND, SQUEEZE, or REVERSAL
+    #   3. Original strategy was a debit spread (BULL_CALL or BEAR_PUT)
+    upgraded_to_long = False
+    orig_strategy_type = strategy_type
+    orig_direction = direction
+    orig_risk_reward = risk_reward
+    orig_target_dte = target_dte
+
+    if iv.iv_rank <= LONG_OPTION_IV_RANK_CEILING:
+        if regime.regime == Regime.STRONG_UPTREND and strategy_type == StrategyType.BULL_CALL_SPREAD:
+            strategy_type = StrategyType.LONG_CALL
+            direction = "BULLISH"
+            risk_reward = "DEBIT"
+            target_dte = DEFAULT_DTE_LONG_OPTION
+            upgraded_to_long = True
+
+        elif regime.regime == Regime.STRONG_DOWNTREND and strategy_type == StrategyType.BEAR_PUT_SPREAD:
+            strategy_type = StrategyType.LONG_PUT
+            direction = "BEARISH"
+            risk_reward = "DEBIT"
+            target_dte = DEFAULT_DTE_LONG_OPTION
+            upgraded_to_long = True
+
+        elif regime.regime == Regime.SQUEEZE and strategy_type == StrategyType.LONG_BUTTERFLY:
+            ds = getattr(regime, "direction_score", 0.0)
+            if ds > 0.15:
+                strategy_type = StrategyType.LONG_CALL
+                direction = "BULLISH"
+                risk_reward = "DEBIT"
+                target_dte = DEFAULT_DTE_LONG_OPTION
+                upgraded_to_long = True
+            elif ds < -0.15:
+                strategy_type = StrategyType.LONG_PUT
+                direction = "BEARISH"
+                risk_reward = "DEBIT"
+                target_dte = DEFAULT_DTE_LONG_OPTION
+                upgraded_to_long = True
+
+        elif regime.regime == Regime.REVERSAL_UP and iv.iv_regime == "LOW":
+            strategy_type = StrategyType.LONG_CALL
+            direction = "BULLISH"
+            risk_reward = "DEBIT"
+            target_dte = DEFAULT_DTE_LONG_OPTION
+            upgraded_to_long = True
+
+        elif regime.regime == Regime.REVERSAL_DOWN and iv.iv_regime == "LOW":
+            strategy_type = StrategyType.LONG_PUT
+            direction = "BEARISH"
+            risk_reward = "DEBIT"
+            target_dte = DEFAULT_DTE_LONG_OPTION
+            upgraded_to_long = True
+
+    # Compute initial confidence (needed for downgrade check)
     confidence = _compute_confidence(regime, iv, strategy_type)
+
+    # Enforce higher confidence floor for long options
+    if upgraded_to_long and confidence < LONG_OPTION_MIN_CONFIDENCE:
+        logger.info(
+            f"{regime.ticker}: long option downgraded back to spread — "
+            f"confidence {confidence:.2f} < {LONG_OPTION_MIN_CONFIDENCE}"
+        )
+        strategy_type = orig_strategy_type
+        direction = orig_direction
+        risk_reward = orig_risk_reward
+        target_dte = orig_target_dte
+        upgraded_to_long = False
+        confidence = _compute_confidence(regime, iv, strategy_type)
+
     rationale = _build_rationale(regime, iv, strategy_type)
+    if upgraded_to_long:
+        rationale += " | ⬆ Upgraded to long option (LOW IV + strong trend)"
 
     return StrategyRecommendation(
         ticker=regime.ticker,
@@ -270,6 +350,11 @@ _DEBIT_STRATEGIES = {
     StrategyType.BULL_CALL_SPREAD,
     StrategyType.BEAR_PUT_SPREAD,
     StrategyType.LONG_BUTTERFLY,
+}
+# V3: long naked options
+_LONG_OPTION_STRATEGIES = {
+    StrategyType.LONG_CALL,
+    StrategyType.LONG_PUT,
 }
 
 
@@ -350,6 +435,59 @@ def _compute_confidence(
     if strategy in _CREDIT_STRATEGIES and getattr(iv, "premium_rich", False):
         score += 0.05
 
+    # ── V3: Long option conviction scoring ───────────────────────────────────
+    if strategy in _LONG_OPTION_STRATEGIES:
+        ta = getattr(regime, "ta_signals", {})
+
+        if strategy == StrategyType.LONG_CALL and ta.get("breakout_above"):
+            score += 0.10
+        elif strategy == StrategyType.LONG_PUT and ta.get("breakdown_below"):
+            score += 0.10
+
+        if strategy == StrategyType.LONG_CALL and ta.get("bullish_divergence"):
+            score += 0.10 * (1 + ta.get("divergence_strength", 0))
+        elif strategy == StrategyType.LONG_PUT and ta.get("bearish_divergence"):
+            score += 0.10 * (1 + ta.get("divergence_strength", 0))
+
+        if ta.get("squeeze_fired"):
+            if strategy == StrategyType.LONG_CALL and ta.get("squeeze_direction") == "UP":
+                score += 0.10
+            elif strategy == StrategyType.LONG_PUT and ta.get("squeeze_direction") == "DOWN":
+                score += 0.10
+
+        if ta.get("volume_climax"):
+            if strategy == StrategyType.LONG_CALL and ta.get("climax_direction") == "UP":
+                score += 0.05
+            elif strategy == StrategyType.LONG_PUT and ta.get("climax_direction") == "DOWN":
+                score += 0.05
+
+        if strategy == StrategyType.LONG_CALL and ta.get("near_support"):
+            score += 0.05
+        elif strategy == StrategyType.LONG_PUT and ta.get("near_resistance"):
+            score += 0.05
+
+        if strategy == StrategyType.LONG_CALL and ta.get("above_anchored_vwap"):
+            score += 0.05
+        elif strategy == StrategyType.LONG_PUT and ta.get("below_anchored_vwap"):
+            score += 0.05
+
+    # ── V3: TA signals boost/penalise spread strategies ───────────────────────
+    elif strategy in _DEBIT_STRATEGIES or strategy in _CREDIT_STRATEGIES:
+        ta = getattr(regime, "ta_signals", {})
+        pattern_score = ta.get("pattern_score", 0.0)
+
+        bullish_strats = {StrategyType.BULL_CALL_SPREAD, StrategyType.BULL_PUT_SPREAD}
+        bearish_strats = {StrategyType.BEAR_PUT_SPREAD, StrategyType.BEAR_CALL_SPREAD}
+
+        if strategy in bullish_strats and pattern_score > 0.3:
+            score += 0.08
+        elif strategy in bearish_strats and pattern_score < -0.3:
+            score += 0.08
+        elif strategy in bullish_strats and pattern_score < -0.3:
+            score -= 0.08
+        elif strategy in bearish_strats and pattern_score > 0.3:
+            score -= 0.08
+
     return min(max(score, 0.0), 1.0)
 
 
@@ -382,5 +520,22 @@ def _build_rationale(
     # NEW: flag premium richness
     if getattr(iv, "premium_rich", False) and strategy in _CREDIT_STRATEGIES:
         parts.append(f"IV-RV spread={iv.iv_rv_spread:+.1f}pts ✓")
+
+    # V3: TA signal notes
+    ta = getattr(regime, "ta_signals", {})
+    if ta.get("breakout_above"):
+        parts.append("Breakout ↑ vol confirm")
+    if ta.get("breakdown_below"):
+        parts.append("Breakdown ↓ vol confirm")
+    if ta.get("bullish_divergence"):
+        parts.append(f"RSI bull div ({ta.get('divergence_strength', 0):.0%})")
+    if ta.get("bearish_divergence"):
+        parts.append(f"RSI bear div ({ta.get('divergence_strength', 0):.0%})")
+    if ta.get("squeeze_fired"):
+        parts.append(f"Squeeze fired {ta.get('squeeze_direction', '')}")
+    if ta.get("volume_climax"):
+        parts.append(f"Vol climax {ta.get('climax_direction', '')}")
+    if ta.get("inside_bar"):
+        parts.append("Inside bar")
 
     return " | ".join(parts)

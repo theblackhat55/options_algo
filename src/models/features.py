@@ -35,6 +35,14 @@ NUMERIC_FEATURES = [
     # IBKR real-time features at entry (nullable — filled with median)
     "options_flow_score", "put_call_volume_ratio", "volume_pace",
     "live_iv_at_entry", "iv_skew_at_entry",
+    # V3: Long option + TA features
+    "ta_pattern_score", "entry_theta_rate", "entry_iv_rank",
+]
+
+BINARY_FEATURES = [
+    "ta_breakout",    # V3: price broke resistance with volume at entry
+    "ta_divergence",  # V3: RSI divergence detected at entry
+    "is_long_option", # V3: LONG_CALL or LONG_PUT (vs spread/IC)
 ]
 
 CATEGORICAL_FEATURES = [
@@ -71,10 +79,20 @@ def build_features(
     X_parts = []
     feature_names = []
 
-    num_df = df[NUMERIC_FEATURES].copy()
+    # Numeric features
+    available_num = [f for f in NUMERIC_FEATURES if f in df.columns]
+    num_df = df[available_num].copy()
     num_df = num_df.fillna(num_df.median())
     X_parts.append(num_df)
-    feature_names.extend(NUMERIC_FEATURES)
+    feature_names.extend(available_num)
+
+    # Binary features (bool → int)
+    available_bin = [f for f in BINARY_FEATURES if f in df.columns]
+    for col in available_bin:
+        bin_s = df[col].fillna(False).astype(int)
+        bin_s.name = col
+        X_parts.append(bin_s)
+        feature_names.append(col)
 
     # Categorical features (label encoded)
     if encode_categoricals:
