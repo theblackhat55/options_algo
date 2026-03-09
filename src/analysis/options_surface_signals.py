@@ -40,6 +40,8 @@ class SurfaceAdjustment:
     notes: list[str] = field(default_factory=list)
 
     liquidity_quality: str = "UNKNOWN"
+    quote_availability: str = "UNKNOWN"
+
     put_heavy: bool = False
     call_heavy: bool = False
     neutral_pin_risk: bool = False
@@ -87,6 +89,7 @@ def analyze_surface_adjustment(
 
     adj = SurfaceAdjustment(
         liquidity_quality="UNKNOWN",
+        quote_availability="UNKNOWN",
         valid_quote_ratio=valid_quote_ratio,
         valid_spread_count=valid_spread_count,
         spread_sample_size=spread_sample_size,
@@ -129,6 +132,15 @@ def analyze_surface_adjustment(
         and valid_quote_ratio > 0.0
         and valid_quote_ratio < 0.10
     )
+
+    if spread_sample_size <= 0:
+        adj.quote_availability = "UNKNOWN"
+    elif quote_unavailable:
+        adj.quote_availability = "NONE"
+    elif sparse_quotes:
+        adj.quote_availability = "SPARSE"
+    else:
+        adj.quote_availability = "AVAILABLE"
 
     if total_contracts <= 0:
         adj.liquidity_quality = "UNKNOWN"

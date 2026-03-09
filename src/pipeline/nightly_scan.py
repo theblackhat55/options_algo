@@ -405,6 +405,7 @@ def _load_options_surface_row(ticker: str, scan_date: str) -> Dict[str, Any]:
 def _apply_surface_telemetry(rec: Any, surface_row: Dict[str, Any], surface_adj: Any) -> Any:
     try:
         rec.surface_liquidity_quality = _safe_str(getattr(surface_adj, "liquidity_quality", ""), "")
+        rec.surface_quote_availability = _safe_str(getattr(surface_adj, "quote_availability", ""), "")
         rec.surface_liquid_contract_ratio = _safe_float(surface_row.get("surface_liquid_contract_ratio", 0.0), 0.0)
         rec.surface_avg_spread_pct = _safe_float(surface_row.get("surface_avg_spread_pct", 0.0), 0.0)
         rec.surface_median_spread_pct = _safe_float(surface_row.get("surface_median_spread_pct", 0.0), 0.0)
@@ -691,6 +692,7 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                         "surface_bias_strength": _safe_str(_extract_attr(trade, "surface_bias_strength", ""), ""),
                         "surface_bias_rationale": _safe_str(_extract_attr(trade, "surface_bias_rationale", ""), ""),
                         "surface_liquidity_quality": _safe_str(_extract_attr(trade, "surface_liquidity_quality", ""), ""),
+                        "surface_quote_availability": _safe_str(_extract_attr(trade, "surface_quote_availability", ""), ""),
                         "surface_liquid_contract_ratio": _safe_float(_extract_attr(trade, "surface_liquid_contract_ratio", 0.0), 0.0),
                         "surface_avg_spread_pct": _safe_float(_extract_attr(trade, "surface_avg_spread_pct", 0.0), 0.0),
                         "surface_median_spread_pct": _safe_float(_extract_attr(trade, "surface_median_spread_pct", 0.0), 0.0),
@@ -854,6 +856,7 @@ class _SimpleRec:
         self.surface_bias_strength = ""
         self.surface_bias_rationale = ""
         self.surface_liquidity_quality = ""
+        self.surface_quote_availability = ""
         self.surface_liquid_contract_ratio = 0.0
         self.surface_avg_spread_pct = 0.0
         self.surface_median_spread_pct = 0.0
