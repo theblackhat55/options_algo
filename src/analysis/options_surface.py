@@ -41,6 +41,7 @@ class OptionsSurfaceSnapshot:
 
     front_expiry_concentration: float = 0.0
     total_contracts: int = 0
+    quote_source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -257,7 +258,7 @@ def _spread_stats(df: pd.DataFrame) -> tuple[float, float, float, int, int]:
     mid = _compute_mid(df.loc[valid_mask])
 
     spread_pct = ((ask - bid) / mid).replace([np.inf, -np.inf], np.nan).dropna()
-    spread_pct = spread_pct[(spread_pct >= 0) & (spread_pct <= 5.0)]
+    spread_pct = spread_pct[(spread_pct >= 0) & (spread_pct <= 0.25)]
 
     if spread_pct.empty:
         return 0.0, 0.0, valid_quote_ratio, valid_spread_count, spread_sample_size
@@ -325,6 +326,27 @@ def _dominant_strike(
     dist_pct = abs(top_strike - float(spot_price)) / max(float(spot_price), 1e-9)
     return top_strike, _safe_float(dist_pct, 0.0)
 
+
+
+
+def _quote_source_summary(df: pd.DataFrame) -> str:
+    try:
+        if df is None or df.empty or "source" not in df.columns:
+            return "NONE"
+        src = df["source"].astype(str).str.lower()
+        if src.str.contains("ibkr").any():
+            return "IBKR"
+        if src.str.contains("massive").any() or src.str.contains("polygon").any():
+            valid = (
+                pd.to_numeric(df.get("bid", 0), errors="coerce").fillna(0) > 0
+            ) & (
+                pd.to_numeric(df.get("ask", 0), errors="coerce").fillna(0) > 0
+            )
+            if valid.any():
+                return "MASSIVE_DELAYED"
+        return "NONE"
+    except Exception:
+        return "NONE"
 
 def _front_expiry_concentration(df: pd.DataFrame) -> float:
     if df.empty or "expiration" not in df.columns:
@@ -409,4 +431,5 @@ def analyze_options_surface(
         top_volume_strike_distance_pct=_safe_float(top_volume_strike_distance_pct, 0.0),
         front_expiry_concentration=_safe_float(front_expiry_concentration, 0.0),
         total_contracts=_safe_int(total_contracts, 0),
+        quote_source=_quote_source_summary(df),
     )

@@ -452,7 +452,9 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
 
     conf_delta = _safe_float(getattr(adj, "confidence_delta", 0.0), 0.0)
     score_delta = _safe_float(getattr(adj, "candidate_score_delta", 0.0), 0.0)
-    adj_notes = _safe_str(getattr(adj, "notes", ""), "")
+    adj_notes = _normalize_note_text(getattr(adj, "adjustment_notes", []), "")
+    if not adj_notes:
+        adj_notes = _safe_str(getattr(adj, "notes", ""), "")
 
     try:
         base_conf = _extract_confidence(rec)
@@ -532,6 +534,8 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
         rec.surface_strategy_changed = strategy_changed
         rec.surface_bias_strength = bias_strength
         rec.surface_bias_rationale = bias_notes
+        if not _safe_str(_extract_attr(rec, "surface_quote_source", ""), ""):
+            rec.surface_quote_source = _safe_str(_extract_attr(surface_row, "surface_quote_source", ""), "")
     except Exception:
         pass
 
@@ -693,6 +697,7 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                         "surface_bias_rationale": _safe_str(_extract_attr(trade, "surface_bias_rationale", ""), ""),
                         "surface_liquidity_quality": _safe_str(_extract_attr(trade, "surface_liquidity_quality", ""), ""),
                         "surface_quote_availability": _safe_str(_extract_attr(trade, "surface_quote_availability", ""), ""),
+            "surface_quote_source": _safe_str(_extract_attr(trade, "surface_quote_source", ""), ""),
                         "surface_liquid_contract_ratio": _safe_float(_extract_attr(trade, "surface_liquid_contract_ratio", 0.0), 0.0),
                         "surface_avg_spread_pct": _safe_float(_extract_attr(trade, "surface_avg_spread_pct", 0.0), 0.0),
                         "surface_median_spread_pct": _safe_float(_extract_attr(trade, "surface_median_spread_pct", 0.0), 0.0),
@@ -857,6 +862,7 @@ class _SimpleRec:
         self.surface_bias_rationale = ""
         self.surface_liquidity_quality = ""
         self.surface_quote_availability = ""
+        self.surface_quote_source = ""
         self.surface_liquid_contract_ratio = 0.0
         self.surface_avg_spread_pct = 0.0
         self.surface_median_spread_pct = 0.0
