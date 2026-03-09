@@ -84,6 +84,40 @@ def _safe_str(value: Any, default: str = "") -> str:
         return default
 
 
+def _normalize_note_text(value: Any, default: str = "") -> str:
+    try:
+        if value is None:
+            return default
+
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+            return ";".join(parts) if parts else default
+
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return default
+
+            # Handle stringified containers like "['a']", '["a", "b"]', "{'a'}"
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")) or (s.startswith("{") and s.endswith("}")):
+                inner = s[1:-1].strip()
+                if not inner:
+                    return default
+                parts = []
+                for piece in inner.split(","):
+                    p = piece.strip().strip("'").strip('"').strip()
+                    if p:
+                        parts.append(p)
+                return ";".join(parts) if parts else default
+
+            return s
+
+        out = str(value).strip()
+        return out if out else default
+    except Exception:
+        return default
+
+
 def _serialize(value: Any) -> Any:
     if is_dataclass(value):
         try:
@@ -368,6 +402,32 @@ def _load_options_surface_row(ticker: str, scan_date: str) -> Dict[str, Any]:
         return {}
 
 
+def _apply_surface_telemetry(rec: Any, surface_row: Dict[str, Any], surface_adj: Any) -> Any:
+    try:
+        rec.surface_liquidity_quality = _safe_str(getattr(surface_adj, "liquidity_quality", ""), "")
+        rec.surface_liquid_contract_ratio = _safe_float(surface_row.get("surface_liquid_contract_ratio", 0.0), 0.0)
+        rec.surface_avg_spread_pct = _safe_float(surface_row.get("surface_avg_spread_pct", 0.0), 0.0)
+        rec.surface_median_spread_pct = _safe_float(surface_row.get("surface_median_spread_pct", 0.0), 0.0)
+        rec.surface_valid_quote_ratio = _safe_float(surface_row.get("surface_valid_quote_ratio", 0.0), 0.0)
+        rec.surface_valid_spread_count = _safe_int(surface_row.get("surface_valid_spread_count", 0), 0)
+        rec.surface_spread_sample_size = _safe_int(surface_row.get("surface_spread_sample_size", 0), 0)
+        rec.surface_front_expiry_concentration = _safe_float(surface_row.get("surface_front_expiry_concentration", 0.0), 0.0)
+        rec.surface_top_oi_strike_distance_pct = _safe_float(surface_row.get("surface_top_oi_strike_distance_pct", 0.0), 0.0)
+        rec.surface_term_slope = _safe_float(surface_row.get("surface_term_slope", 0.0), 0.0)
+        rec.surface_term_ratio = _safe_float(surface_row.get("surface_term_ratio", 0.0), 0.0)
+        rec.surface_put_call_oi_ratio = _safe_float(surface_row.get("surface_put_call_oi_ratio", 0.0), 0.0)
+        rec.surface_put_call_volume_ratio = _safe_float(surface_row.get("surface_put_call_volume_ratio", 0.0), 0.0)
+        rec.surface_total_contracts = _safe_int(surface_row.get("surface_total_contracts", 0), 0)
+        rec.surface_put_heavy = bool(getattr(surface_adj, "put_heavy", False))
+        rec.surface_call_heavy = bool(getattr(surface_adj, "call_heavy", False))
+        rec.surface_neutral_pin_risk = bool(getattr(surface_adj, "neutral_pin_risk", False))
+        rec.surface_long_vega_friendly = bool(getattr(surface_adj, "long_vega_friendly", False))
+        rec.surface_short_premium_friendly = bool(getattr(surface_adj, "short_premium_friendly", False))
+    except Exception:
+        pass
+    return rec
+
+
 def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
     ticker = _extract_ticker(rec)
     if not ticker:
@@ -386,6 +446,8 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
         strategy=original_strategy,
         surface_row=surface_row,
     )
+
+    rec = _apply_surface_telemetry(rec, surface_row, adj)
 
     conf_delta = _safe_float(getattr(adj, "confidence_delta", 0.0), 0.0)
     score_delta = _safe_float(getattr(adj, "candidate_score_delta", 0.0), 0.0)
@@ -619,15 +681,34 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                             _extract_attr(trade, "candidate_score", _extract_attr(trade, "cand_score", 0.0)),
                             0.0,
                         ),
-                        "notes": _safe_str(_extract_attr(trade, "notes", ""), ""),
+                        "notes": _normalize_note_text(_extract_attr(trade, "notes", ""), ""),
                         "surface_confidence_delta": _safe_float(_extract_attr(trade, "surface_confidence_delta", 0.0), 0.0),
                         "surface_candidate_score_delta": _safe_float(_extract_attr(trade, "surface_candidate_score_delta", 0.0), 0.0),
-                        "surface_adjustment_notes": _safe_str(_extract_attr(trade, "surface_adjustment_notes", ""), ""),
+                        "surface_adjustment_notes": _normalize_note_text(_extract_attr(trade, "surface_adjustment_notes", ""), ""),
                         "surface_original_strategy": _safe_str(_extract_attr(trade, "surface_original_strategy", ""), ""),
                         "surface_preferred_strategy": _safe_str(_extract_attr(trade, "surface_preferred_strategy", ""), ""),
                         "surface_strategy_changed": bool(_extract_attr(trade, "surface_strategy_changed", False)),
                         "surface_bias_strength": _safe_str(_extract_attr(trade, "surface_bias_strength", ""), ""),
                         "surface_bias_rationale": _safe_str(_extract_attr(trade, "surface_bias_rationale", ""), ""),
+                        "surface_liquidity_quality": _safe_str(_extract_attr(trade, "surface_liquidity_quality", ""), ""),
+                        "surface_liquid_contract_ratio": _safe_float(_extract_attr(trade, "surface_liquid_contract_ratio", 0.0), 0.0),
+                        "surface_avg_spread_pct": _safe_float(_extract_attr(trade, "surface_avg_spread_pct", 0.0), 0.0),
+                        "surface_median_spread_pct": _safe_float(_extract_attr(trade, "surface_median_spread_pct", 0.0), 0.0),
+                        "surface_valid_quote_ratio": _safe_float(_extract_attr(trade, "surface_valid_quote_ratio", 0.0), 0.0),
+                        "surface_valid_spread_count": _safe_int(_extract_attr(trade, "surface_valid_spread_count", 0), 0),
+                        "surface_spread_sample_size": _safe_int(_extract_attr(trade, "surface_spread_sample_size", 0), 0),
+                        "surface_front_expiry_concentration": _safe_float(_extract_attr(trade, "surface_front_expiry_concentration", 0.0), 0.0),
+                        "surface_top_oi_strike_distance_pct": _safe_float(_extract_attr(trade, "surface_top_oi_strike_distance_pct", 0.0), 0.0),
+                        "surface_term_slope": _safe_float(_extract_attr(trade, "surface_term_slope", 0.0), 0.0),
+                        "surface_term_ratio": _safe_float(_extract_attr(trade, "surface_term_ratio", 0.0), 0.0),
+                        "surface_put_call_oi_ratio": _safe_float(_extract_attr(trade, "surface_put_call_oi_ratio", 0.0), 0.0),
+                        "surface_put_call_volume_ratio": _safe_float(_extract_attr(trade, "surface_put_call_volume_ratio", 0.0), 0.0),
+                        "surface_total_contracts": _safe_int(_extract_attr(trade, "surface_total_contracts", 0), 0),
+                        "surface_put_heavy": bool(_extract_attr(trade, "surface_put_heavy", False)),
+                        "surface_call_heavy": bool(_extract_attr(trade, "surface_call_heavy", False)),
+                        "surface_neutral_pin_risk": bool(_extract_attr(trade, "surface_neutral_pin_risk", False)),
+                        "surface_long_vega_friendly": bool(_extract_attr(trade, "surface_long_vega_friendly", False)),
+                        "surface_short_premium_friendly": bool(_extract_attr(trade, "surface_short_premium_friendly", False)),
                         "sector": _extract_sector(trade),
                         "price": _extract_price(trade),
                     },
@@ -772,6 +853,25 @@ class _SimpleRec:
         self.surface_strategy_changed = False
         self.surface_bias_strength = ""
         self.surface_bias_rationale = ""
+        self.surface_liquidity_quality = ""
+        self.surface_liquid_contract_ratio = 0.0
+        self.surface_avg_spread_pct = 0.0
+        self.surface_median_spread_pct = 0.0
+        self.surface_valid_quote_ratio = 0.0
+        self.surface_valid_spread_count = 0
+        self.surface_spread_sample_size = 0
+        self.surface_front_expiry_concentration = 0.0
+        self.surface_top_oi_strike_distance_pct = 0.0
+        self.surface_term_slope = 0.0
+        self.surface_term_ratio = 0.0
+        self.surface_put_call_oi_ratio = 0.0
+        self.surface_put_call_volume_ratio = 0.0
+        self.surface_total_contracts = 0
+        self.surface_put_heavy = False
+        self.surface_call_heavy = False
+        self.surface_neutral_pin_risk = False
+        self.surface_long_vega_friendly = False
+        self.surface_short_premium_friendly = False
 
 
 def _fallback_recommendations(classified: Dict[str, Any]) -> List[Any]:

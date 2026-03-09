@@ -1,182 +1,188 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
+        out = float(value)
+        if out != out or out in (float("inf"), float("-inf")):
             return default
-        return float(value)
+        return out
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
     except Exception:
         return default
 
 
 def _safe_str(value: Any, default: str = "") -> str:
     try:
-        if value is None:
-            return default
-        return str(value)
+        s = str(value)
+        return s if s else default
     except Exception:
         return default
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 @dataclass
 class SurfaceAdjustment:
-    ticker: str
-    liquidity_ok: bool
-    liquidity_quality: str
-    crowded_front: bool
-    put_heavy: bool
-    call_heavy: bool
-    neutral_pin_risk: bool
-    long_vega_friendly: bool
-    short_premium_friendly: bool
-    confidence_delta: float
-    candidate_score_delta: float
-    notes: str
+    confidence_delta: float = 0.0
+    candidate_score_delta: float = 0.0
+    notes: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    liquidity_quality: str = "UNKNOWN"
+    put_heavy: bool = False
+    call_heavy: bool = False
+    neutral_pin_risk: bool = False
+    long_vega_friendly: bool = False
+    short_premium_friendly: bool = False
+
+    valid_quote_ratio: float = 0.0
+    valid_spread_count: int = 0
+    spread_sample_size: int = 0
+    liquid_contract_ratio: float = 0.0
+    avg_spread_pct: float = 0.0
+    median_spread_pct: float = 0.0
+    front_expiry_concentration: float = 0.0
+    top_oi_strike_distance_pct: float = 0.0
+    term_slope: float = 0.0
+    term_ratio: float = 0.0
+    put_call_oi_ratio: float = 0.0
+    put_call_volume_ratio: float = 0.0
+    total_contracts: int = 0
 
 
 def analyze_surface_adjustment(
     ticker: str,
     direction: str,
     strategy: str,
-    surface_row: Dict[str, Any] | None,
+    surface_row: dict[str, Any] | None,
 ) -> SurfaceAdjustment:
     row = surface_row or {}
 
-    liq_ratio = _safe_float(row.get("surface_liquid_contract_ratio", 0.0), 0.0)
-    avg_spread = _safe_float(row.get("surface_avg_spread_pct", 0.0), 0.0)
-    median_spread = _safe_float(row.get("surface_median_spread_pct", 0.0), 0.0)
+    liquid_contract_ratio = _clamp(_safe_float(row.get("surface_liquid_contract_ratio", 0.0), 0.0), 0.0, 1.0)
+    avg_spread_pct = _safe_float(row.get("surface_avg_spread_pct", 0.0), 0.0)
+    median_spread_pct = _safe_float(row.get("surface_median_spread_pct", 0.0), 0.0)
+
+    valid_quote_ratio = _clamp(_safe_float(row.get("surface_valid_quote_ratio", 0.0), 0.0), 0.0, 1.0)
+    valid_spread_count = max(0, _safe_int(row.get("surface_valid_spread_count", 0), 0))
+    spread_sample_size = max(0, _safe_int(row.get("surface_spread_sample_size", 0), 0))
+
+    front_expiry_concentration = _clamp(_safe_float(row.get("surface_front_expiry_concentration", 0.0), 0.0), 0.0, 1.0)
+    top_oi_strike_distance_pct = max(0.0, _safe_float(row.get("surface_top_oi_strike_distance_pct", 0.0), 0.0))
     term_slope = _safe_float(row.get("surface_term_slope", 0.0), 0.0)
     term_ratio = _safe_float(row.get("surface_term_ratio", 0.0), 0.0)
-    pc_oi = _safe_float(row.get("surface_put_call_oi_ratio", 0.0), 0.0)
-    pc_vol = _safe_float(row.get("surface_put_call_volume_ratio", 0.0), 0.0)
-    skew_proxy = _safe_float(row.get("surface_skew_proxy", 0.0), 0.0)
-    top_oi_dist = abs(_safe_float(row.get("surface_top_oi_strike_distance_pct", 999.0), 999.0))
-    front_conc = _safe_float(row.get("surface_front_expiry_concentration", 0.0), 0.0)
-    total_contracts = _safe_float(row.get("surface_total_contracts", 0.0), 0.0)
+    put_call_oi_ratio = max(0.0, _safe_float(row.get("surface_put_call_oi_ratio", 0.0), 0.0))
+    put_call_volume_ratio = max(0.0, _safe_float(row.get("surface_put_call_volume_ratio", 0.0), 0.0))
+    total_contracts = max(0, _safe_int(row.get("surface_total_contracts", 0), 0))
 
-    direction = _safe_str(direction).upper()
-    strategy_u = _safe_str(strategy).upper()
-
-    long_vega_keywords = ("LONG_CALL", "LONG_PUT", "LONG_STRADDLE", "LONG_STRANGLE", "LONG_BUTTERFLY", "BUTTERFLY")
-    short_premium_keywords = ("IRON_CONDOR", "CREDIT", "SHORT", "VERTICAL", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
-
-    # Liquidity quality bucket: use one bucket instead of stacking many penalties
-    if total_contracts <= 0:
-        liquidity_quality = "UNKNOWN"
-    elif liq_ratio >= 0.45 and avg_spread <= 0.08 and median_spread <= 0.06:
-        liquidity_quality = "STRONG"
-    elif liq_ratio >= 0.25 and avg_spread <= 0.15 and median_spread <= 0.10:
-        liquidity_quality = "OK"
-    elif liq_ratio >= 0.12 and avg_spread <= 0.25 and median_spread <= 0.18:
-        liquidity_quality = "WEAK"
-    else:
-        liquidity_quality = "POOR"
-
-    liquidity_ok = liquidity_quality in {"STRONG", "OK"}
-    crowded_front = front_conc >= 0.60
-    put_heavy = pc_oi >= 1.25 or pc_vol >= 1.25
-    call_heavy = (0.0 < pc_oi <= 0.80) or (0.0 < pc_vol <= 0.80)
-    neutral_pin_risk = top_oi_dist <= 0.02 and total_contracts > 0
-    long_vega_friendly = term_slope > 0.0 or term_ratio > 1.0
-    short_premium_friendly = term_slope < 0.0 or (0.0 < term_ratio < 1.0)
-
-    confidence_delta = 0.0
-    candidate_score_delta = 0.0
-    notes = []
-
-    # Liquidity bucket penalties/boosts: only one main bucket applied
-    if liquidity_quality == "STRONG":
-        candidate_score_delta += 0.02
-        notes.append("strong_liquidity")
-    elif liquidity_quality == "OK":
-        candidate_score_delta += 0.01
-        notes.append("acceptable_liquidity")
-    elif liquidity_quality == "WEAK":
-        confidence_delta -= 0.02
-        candidate_score_delta -= 0.02
-        notes.append("weak_liquidity")
-    elif liquidity_quality == "POOR":
-        confidence_delta -= 0.04
-        candidate_score_delta -= 0.04
-        notes.append("poor_liquidity")
-
-    # Directional positioning: gentle adjustments
-    if direction == "BULLISH":
-        if call_heavy:
-            confidence_delta += 0.02
-            notes.append("bullish_call_positioning")
-        elif put_heavy:
-            confidence_delta -= 0.02
-            notes.append("bearish_put_positioning_against_bull")
-    elif direction == "BEARISH":
-        if put_heavy:
-            confidence_delta += 0.02
-            notes.append("bearish_put_positioning")
-        elif call_heavy:
-            confidence_delta -= 0.02
-            notes.append("bullish_call_positioning_against_bear")
-
-    # Strategy-aware term structure
-    if any(k in strategy_u for k in long_vega_keywords):
-        if long_vega_friendly:
-            confidence_delta += 0.02
-            candidate_score_delta += 0.01
-            notes.append("term_structure_supports_long_vega")
-        elif short_premium_friendly:
-            confidence_delta -= 0.02
-            notes.append("term_structure_unfavorable_long_vega")
-
-    if any(k in strategy_u for k in short_premium_keywords):
-        if short_premium_friendly:
-            confidence_delta += 0.02
-            candidate_score_delta += 0.01
-            notes.append("term_structure_supports_short_premium")
-        elif long_vega_friendly:
-            confidence_delta -= 0.02
-            notes.append("term_structure_unfavorable_short_premium")
-
-    # Neutral pinning / concentration: make more selective
-    if neutral_pin_risk and crowded_front and direction == "NEUTRAL" and liquidity_ok:
-        confidence_delta += 0.02
-        candidate_score_delta += 0.01
-        notes.append("neutral_pin_support")
-    elif neutral_pin_risk and direction in {"BULLISH", "BEARISH"}:
-        confidence_delta -= 0.01
-        notes.append("pin_risk_against_directional")
-
-    if crowded_front and not liquidity_ok:
-        candidate_score_delta -= 0.01
-        notes.append("crowded_front_with_weak_liquidity")
-
-    # Skew proxy
-    if skew_proxy > 0.05 and direction == "BEARISH":
-        confidence_delta += 0.01
-        notes.append("put_skew_supports_bearish")
-    elif skew_proxy > 0.05 and direction == "BULLISH":
-        confidence_delta -= 0.01
-        notes.append("put_skew_against_bullish")
-
-    confidence_delta = max(-0.08, min(0.08, confidence_delta))
-    candidate_score_delta = max(-0.08, min(0.08, candidate_score_delta))
-
-    return SurfaceAdjustment(
-        ticker=ticker,
-        liquidity_ok=liquidity_ok,
-        liquidity_quality=liquidity_quality,
-        crowded_front=crowded_front,
-        put_heavy=put_heavy,
-        call_heavy=call_heavy,
-        neutral_pin_risk=neutral_pin_risk,
-        long_vega_friendly=long_vega_friendly,
-        short_premium_friendly=short_premium_friendly,
-        confidence_delta=confidence_delta,
-        candidate_score_delta=candidate_score_delta,
-        notes=";".join(notes),
+    adj = SurfaceAdjustment(
+        liquidity_quality="UNKNOWN",
+        valid_quote_ratio=valid_quote_ratio,
+        valid_spread_count=valid_spread_count,
+        spread_sample_size=spread_sample_size,
+        liquid_contract_ratio=liquid_contract_ratio,
+        avg_spread_pct=avg_spread_pct,
+        median_spread_pct=median_spread_pct,
+        front_expiry_concentration=front_expiry_concentration,
+        top_oi_strike_distance_pct=top_oi_strike_distance_pct,
+        term_slope=term_slope,
+        term_ratio=term_ratio,
+        put_call_oi_ratio=put_call_oi_ratio,
+        put_call_volume_ratio=put_call_volume_ratio,
+        total_contracts=total_contracts,
     )
+
+    direction_u = _safe_str(direction, "NEUTRAL").upper()
+    strategy_u = _safe_str(strategy, "WATCHLIST").upper()
+
+    adj.put_heavy = put_call_oi_ratio >= 1.25 or put_call_volume_ratio >= 1.25
+    adj.call_heavy = (
+        (put_call_oi_ratio > 0 and put_call_oi_ratio <= 0.80)
+        or (put_call_volume_ratio > 0 and put_call_volume_ratio <= 0.80)
+    )
+    adj.neutral_pin_risk = (
+        direction_u == "NEUTRAL"
+        and front_expiry_concentration >= 0.20
+        and top_oi_strike_distance_pct <= 0.02
+    )
+    adj.long_vega_friendly = term_slope >= 0.02 or term_ratio >= 1.05
+    adj.short_premium_friendly = term_slope <= -0.02 or (0 < term_ratio <= 0.97)
+
+    quote_unavailable = (
+        spread_sample_size > 0
+        and valid_quote_ratio == 0.0
+        and valid_spread_count == 0
+    )
+
+    sparse_quotes = (
+        spread_sample_size > 0
+        and valid_quote_ratio > 0.0
+        and valid_quote_ratio < 0.10
+    )
+
+    if total_contracts <= 0:
+        adj.liquidity_quality = "UNKNOWN"
+    elif quote_unavailable:
+        adj.liquidity_quality = "UNKNOWN"
+        adj.confidence_delta -= 0.01
+        adj.candidate_score_delta -= 0.01
+        adj.notes.append("quote_unavailable")
+    elif sparse_quotes:
+        adj.liquidity_quality = "WEAK"
+        adj.confidence_delta -= 0.02
+        adj.candidate_score_delta -= 0.02
+        adj.notes.append("sparse_quotes")
+    elif liquid_contract_ratio >= 0.35 and avg_spread_pct <= 0.08 and median_spread_pct <= 0.06:
+        adj.liquidity_quality = "OK"
+    elif liquid_contract_ratio >= 0.15 and avg_spread_pct <= 0.18:
+        adj.liquidity_quality = "WEAK"
+        adj.confidence_delta -= 0.01
+        adj.candidate_score_delta -= 0.01
+        adj.notes.append("wide_spreads")
+    else:
+        adj.liquidity_quality = "POOR"
+        adj.confidence_delta -= 0.04
+        adj.candidate_score_delta -= 0.04
+        adj.notes.append("poor_liquidity")
+
+    if adj.neutral_pin_risk and adj.liquidity_quality in {"OK", "WEAK"}:
+        adj.candidate_score_delta += 0.01
+        adj.notes.append("neutral_pin_risk")
+
+    if direction_u == "BULLISH" and adj.call_heavy:
+        adj.candidate_score_delta += 0.01
+        adj.notes.append("call_flow_support")
+    elif direction_u == "BEARISH" and adj.put_heavy:
+        adj.candidate_score_delta += 0.01
+        adj.notes.append("put_flow_support")
+
+    if strategy_u in {"CALENDAR", "DIAGONAL", "DEBIT_SPREAD"} and adj.long_vega_friendly:
+        adj.candidate_score_delta += 0.01
+        adj.notes.append("term_structure_supportive")
+
+    if strategy_u in {"IRON_CONDOR", "CREDIT_SPREAD"} and adj.short_premium_friendly:
+        adj.candidate_score_delta += 0.01
+        adj.notes.append("term_structure_short_premium_friendly")
+
+    adj.confidence_delta = _clamp(adj.confidence_delta, -0.08, 0.08)
+    adj.candidate_score_delta = _clamp(adj.candidate_score_delta, -0.08, 0.08)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for note in adj.notes:
+        if note and note not in seen:
+            seen.add(note)
+            deduped.append(note)
+    adj.notes = deduped
+
+    return adj
