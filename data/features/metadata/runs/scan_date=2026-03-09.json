@@ -1,0 +1,14 @@
+{
+  "scan_date": "2026-03-09",
+  "generated_at": "2026-03-09T18:05:10.033709+00:00",
+  "scan_mode": "dry_run",
+  "elapsed_seconds": 0.1,
+  "universe_size": 2,
+  "qualified": 2,
+  "regimes_classified": 2,
+  "recommendations": 2,
+  "after_event_filter": 2,
+  "trades_constructed": 2,
+  "top_pick_count": 2,
+  "ibkr_enabled": true
+}

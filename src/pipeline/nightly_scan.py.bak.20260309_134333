@@ -25,12 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import pickle
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path as _Path
 from typing import Any
 
 import pandas as pd
@@ -44,7 +41,22 @@ from config.settings import (
     MAX_PER_SECTOR, SPY_DIRECTIONAL_GATE_PCT, IBKR_ENABLED,
     LONG_OPTION_MIN_CONFIDENCE,
 )
-from config.universe import get_universe, get_sector
+from src.features.store import (
+    write_stock_features,
+    write_options_features,
+    write_market_features,
+    write_candidate_features,
+    write_recommendation_features,
+    write_run_metadata,
+)
+from src.features.builders import (
+    build_stock_feature_row,
+    build_options_feature_row,
+    build_market_feature_row,
+    build_candidate_feature_row,
+    build_recommendation_feature_row,
+)
+from config.universe import get_universe, get_sector, get_tradeable_universe
 
 from src.data.stock_fetcher import update_universe
 from src.data.options_fetcher import fetch_options_chain, filter_liquid_options
@@ -67,30 +79,17 @@ from src.strategy.long_put import construct_long_put
 
 from src.risk.event_filter import filter_safe_tickers
 
-from src.features.store import (
-    write_stock_features,
-    write_options_features,
-    write_market_features,
-    write_candidate_features,
-    write_recommendation_features,
-    write_run_metadata,
-)
-from src.features.builders import (
-    build_stock_feature_row,
-    build_options_feature_row,
-    build_market_feature_row,
-    build_candidate_feature_row,
-    build_recommendation_feature_row,
-)
-
 logger = logging.getLogger(__name__)
 
 # ── Phase 5: ML Confidence Blending (optional) ────────────────────────────────
-_ML_MODEL_PATH = _Path(os.getenv("ML_MODEL_PATH", "models/lgb_win_predictor.pkl"))
-_ML_BLEND_HEURISTIC = float(os.getenv("ML_BLEND_HEURISTIC", "0.60"))
-_ML_BLEND_ML = float(os.getenv("ML_BLEND_ML", "0.40"))
-_ml_model = None
+import os
+import pickle
+from pathlib import Path as _Path
 
+_ML_MODEL_PATH = _Path(os.getenv("ML_MODEL_PATH", "models/lgb_win_predictor.pkl"))
+_ML_BLEND_HEURISTIC = float(os.getenv("ML_BLEND_HEURISTIC", "0.60"))  # 60% heuristic
+_ML_BLEND_ML = float(os.getenv("ML_BLEND_ML", "0.40"))                # 40% ML
+_ml_model = None  # lazy-loaded
 
 def _load_ml_model():
     global _ml_model
@@ -108,9 +107,15 @@ def _load_ml_model():
 
 
 def _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis=None) -> list:
+    """
+    Build a numeric feature vector for the ML win predictor.
+    Must match the feature order used when the model was trained
+    (see src/models/features.py NUMERIC_FEATURES + BINARY_FEATURES).
+    """
     rs_rank = rs_analysis.rank if rs_analysis and hasattr(rs_analysis, "rank") else 50.0
     ta_sigs = getattr(regime, "ta_signals", {}) or {}
     return [
+        # numeric
         iv_analysis.iv_rank if iv_analysis else 50.0,
         iv_analysis.iv_hv_ratio if iv_analysis else 1.0,
         regime.adx,
@@ -119,18 +124,19 @@ def _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis=None) -> list
         regime.direction_score,
         float(rs_rank),
         float(rec.target_dte),
-        0.0,
-        0.0,
-        float(rec.confidence * 100),
+        0.0,   # spread_width (N/A for long option)
+        0.0,   # short_delta
+        float(rec.confidence * 100),  # prob_profit proxy
         rec.confidence,
-        0.0,
-        1.0,
-        1.0,
-        0.0,
-        0.0,
+        0.0,   # options_flow_score
+        1.0,   # put_call_volume_ratio
+        1.0,   # volume_pace
+        0.0,   # live_iv_at_entry
+        0.0,   # iv_skew_at_entry
         ta_sigs.get("pattern_score", ta_sigs.get("ta_pattern_score", 0.0)) or 0.0,
-        0.0,
-        iv_analysis.iv_rank if iv_analysis else 50.0,
+        0.0,   # entry_theta_rate
+        iv_analysis.iv_rank if iv_analysis else 50.0,  # entry_iv_rank
+        # binary
         float(ta_sigs.get("breakout_above", False)),
         float(ta_sigs.get("bullish_divergence", False) or ta_sigs.get("bearish_divergence", False)),
         float(rec.strategy.value in ("LONG_CALL", "LONG_PUT")),
@@ -138,33 +144,51 @@ def _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis=None) -> list
 
 
 def _apply_ml_confidence(rec, regime, iv_analysis, rs_analysis=None) -> None:
+    """
+    If lgb_win_predictor.pkl exists, blend ML prediction with heuristic confidence.
+    rec.confidence = 0.60 × heuristic + 0.40 × ML_probability
+    """
     model = _load_ml_model()
     if model is None:
-        return
+        return  # no model → use heuristic confidence as-is
+
     try:
         fv = _build_ml_feature_vector(rec, regime, iv_analysis, rs_analysis)
         import numpy as np
         X = np.array([fv], dtype=float)
-        ml_prob = float(model.predict_proba(X)[0][1])
+        ml_prob = float(model.predict_proba(X)[0][1])  # prob of win
         heuristic = rec.confidence
         blended = _ML_BLEND_HEURISTIC * heuristic + _ML_BLEND_ML * ml_prob
         blended = round(min(max(blended, 0.01), 0.99), 4)
         logger.debug(
-            f"ML blend {rec.ticker}: heuristic={heuristic:.3f} ml={ml_prob:.3f} -> blended={blended:.3f}"
+            f"ML blend {rec.ticker}: heuristic={heuristic:.3f} ml={ml_prob:.3f} "
+            f"→ blended={blended:.3f}"
         )
         rec.confidence = blended
     except Exception as exc:
         logger.debug(f"ML confidence blend failed for {rec.ticker}: {exc}")
 
 
+
+
+# ─── Main Pipeline ────────────────────────────────────────────────────────────
+
 def run_nightly_scan(
     universe_override: list[str] = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    """
+    Full nightly scan pipeline. Returns a signal dictionary.
+
+    Args:
+        universe_override: Optional list of tickers to scan (overrides config)
+        dry_run: If True, skip options chain fetching (faster, for testing)
+
+    Returns:
+        Signal dict with top_picks, metadata, and full recommendations list.
+    """
     start_time = time.time()
     scan_date = datetime.now(timezone.utc).date().isoformat()
-    scan_mode = "dry_run" if dry_run else "production"
-
     logger.info("=" * 60)
     logger.info(f"OPTIONS ALGO — NIGHTLY SCAN  {scan_date}")
     logger.info("=" * 60)
@@ -176,7 +200,7 @@ def run_nightly_scan(
     logger.info(f"  Loaded: {len(data)} tickers")
 
     # ── Step 2: Pre-filter (price + volume) ───────────────────────────────────
-    qualified: dict[str, pd.DataFrame] = {}
+    qualified: dict = {}
     for ticker, df in data.items():
         if df is None or df.empty:
             continue
@@ -187,7 +211,7 @@ def run_nightly_scan(
 
     logger.info(f"Step 2: {len(qualified)} tickers pass price/volume filter")
 
-    # ── Step 3: Market Context ────────────────────────────────────────────────
+    # ── Step 3: Market Context ─────────────────────────────────────────────────
     logger.info("Step 3: Computing market context")
     market_ctx = get_market_context(qualified)
     logger.info(
@@ -201,46 +225,17 @@ def run_nightly_scan(
             f"  VIX SPIKE: {market_ctx.vix_level:.1f} vs 5d avg {market_ctx.vix_5d_avg:.1f}"
         )
 
-    try:
-        market_row = build_market_feature_row(
-            as_of_date=scan_date,
-            market_ctx=market_ctx,
-            scan_mode=scan_mode,
-        )
-        write_market_features(scan_date, [market_row])
-    except Exception as exc:
-        logger.warning(f"Feature store: failed to write market features: {exc}")
-
-    # ── VIX Circuit Breaker ───────────────────────────────────────────────────
+    # ── VIX Circuit Breaker ────────────────────────────────────────────────────
     if market_ctx.vix_tier == "LIQUIDATION":
         logger.warning(
             f"VIX LIQUIDATION mode ({market_ctx.vix_level:.1f} ≥ {VIX_LIQUIDATION_LEVEL}) "
             "— halting all new trade generation"
         )
-        signal = _build_empty_signal(
+        return _build_empty_signal(
             scan_date, start_time, market_ctx,
             reason=f"VIX liquidation ({market_ctx.vix_level:.1f})",
             tickers=tickers, qualified=qualified,
         )
-        try:
-            write_run_metadata(scan_date, {
-                "scan_date": scan_date,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "scan_mode": scan_mode,
-                "elapsed_seconds": round(time.time() - start_time, 1),
-                "universe_size": len(tickers),
-                "qualified": len(qualified),
-                "regimes_classified": 0,
-                "recommendations": 0,
-                "after_event_filter": 0,
-                "trades_constructed": 0,
-                "top_pick_count": 0,
-                "ibkr_enabled": IBKR_ENABLED,
-                "circuit_breaker": signal.get("circuit_breaker"),
-            })
-        except Exception as exc:
-            logger.warning(f"Feature store: failed to write run metadata: {exc}")
-        return signal
 
     if market_ctx.vix_tier == "DEFENSIVE":
         logger.warning(
@@ -248,10 +243,13 @@ def run_nightly_scan(
             "— neutral/credit-only strategies"
         )
 
+    # Gate: don't generate picks in crash conditions
     if market_ctx.market_regime == "CRASH":
         logger.warning("CRASH conditions detected. Generating bear plays only.")
 
     # ── Step 3b: Beta Map ─────────────────────────────────────────────────────
+    # Compute rough 60-day beta vs SPY for every qualified ticker.
+    # Used for net-exposure logging and trade metadata enrichment.
     beta_map: dict[str, float] = {}
     spy_close = qualified.get("SPY", pd.DataFrame()).get("close")
     if spy_close is not None and len(spy_close) >= 60:
@@ -278,7 +276,7 @@ def run_nightly_scan(
     regime_dist = get_regime_summary(regimes)
     logger.info(f"  Distribution: {regime_dist}")
 
-    # ── Step 4b: TA Signals (levels + patterns) ───────────────────────────────
+    # ── Step 4b: TA Signals (levels + patterns) ────────────────────────────────
     logger.info("Step 4b: Computing TA signals (S/R levels + pattern detection)")
     try:
         level_map = analyze_universe_levels(qualified)
@@ -288,6 +286,7 @@ def run_nightly_scan(
         for ticker, regime in regime_map.items():
             signals: dict = {}
 
+            # Attach level analysis
             la = level_map.get(ticker)
             if la is not None:
                 signals.update({
@@ -301,6 +300,7 @@ def run_nightly_scan(
                     "high_volume_node": la.high_volume_node,
                 })
 
+            # Attach pattern signals
             ps = pattern_map.get(ticker)
             if ps is not None:
                 signals.update({
@@ -328,48 +328,20 @@ def run_nightly_scan(
     except Exception as exc:
         logger.warning(f"  Step 4b TA signals failed (non-fatal): {exc}")
 
-    # ── Step 5: Relative Strength ─────────────────────────────────────────────
+    # ── Step 5: Relative Strength ──────────────────────────────────────────────
     logger.info("Step 5: Computing relative strength")
     rs_map = rank_universe_rs(qualified)
 
     # ── Step 6: IV Analysis ───────────────────────────────────────────────────
     logger.info("Step 6: Analyzing implied volatility")
-    iv_map: dict[str, Any] = {}
+    iv_map = {}
     for ticker in qualified:
         iv = analyze_iv(ticker, qualified[ticker])
         if iv is not None:
             iv_map[ticker] = iv
     logger.info(f"  IV analyzed: {len(iv_map)} tickers")
 
-    try:
-        for ticker in qualified:
-            regime = regime_map.get(ticker)
-            iv = iv_map.get(ticker)
-            rs = rs_map.get(ticker)
-
-            if regime is not None:
-                stock_row = build_stock_feature_row(
-                    ticker=ticker,
-                    as_of_date=scan_date,
-                    regime=regime,
-                    rs=rs,
-                    sector=get_sector(ticker),
-                    scan_mode=scan_mode,
-                )
-                write_stock_features(ticker, scan_date, [stock_row])
-
-            if iv is not None:
-                options_row = build_options_feature_row(
-                    ticker=ticker,
-                    as_of_date=scan_date,
-                    iv=iv,
-                    scan_mode=scan_mode,
-                )
-                write_options_features(ticker, scan_date, [options_row])
-    except Exception as exc:
-        logger.warning(f"Feature store: failed to write stock/options features: {exc}")
-
-    # ── Step 6b: IBKR Real-time Enrichment ────────────────────────────────────
+    # ── Step 6b: IBKR Real-time Enrichment ───────────────────────────────────
     logger.info("Step 6b: IBKR real-time enrichment (options flow, live IV)")
     rt_enrichment: dict[str, dict] = {}
     if not dry_run and IBKR_ENABLED:
@@ -379,7 +351,8 @@ def run_nightly_scan(
 
             ib_rt = connect_ibkr()
             if ib_rt:
-                tickers_to_enrich = [t for t in iv_map][:30]
+                # Only enrich tickers that passed IV analysis (top candidates)
+                tickers_to_enrich = [t for t in iv_map][:30]  # cap at 30 (IBKR pacing)
                 for t in tickers_to_enrich:
                     stock_df = qualified.get(t)
                     rt = fetch_realtime_enrichment(ib_rt, t, stock_df=stock_df)
@@ -395,6 +368,8 @@ def run_nightly_scan(
     # ── Step 7: Strategy Selection ────────────────────────────────────────────
     logger.info("Step 7: Selecting strategies")
     recommendations = []
+    # Pass SPY 5-day return to the strategy selector so it can block directional
+    # trades that fight the broad market tape (V2: SPY gate)
     spy_ret_5d = market_ctx.spy_return_5d
     logger.info(f"  SPY 5d return: {spy_ret_5d:+.2f}% (gate: ±{SPY_DIRECTIONAL_GATE_PCT:.1f}%)")
 
@@ -404,24 +379,27 @@ def run_nightly_scan(
         rec = select_strategy(
             regime_map[ticker],
             iv_map[ticker],
-            spy_return_5d=spy_ret_5d,
+            spy_return_5d=spy_ret_5d,   # V2: market context gate
         )
         if rec.strategy != StrategyType.SKIP:
+            # Boost confidence if RS is strong/weak and aligned with direction
             rs = rs_map.get(ticker)
             if rs:
                 _adjust_confidence_for_rs(rec, rs)
 
+            # Adjust confidence based on real-time options flow
             rt = rt_enrichment.get(ticker, {})
             flow_score = rt.get("flow_score", 0)
             dominant_side = rt.get("dominant_side", "NEUTRAL")
-            if flow_score > 60:
+            if flow_score > 60:  # Unusual activity threshold
                 if (dominant_side == "CALLS" and rec.direction == "BULLISH") or \
                    (dominant_side == "PUTS" and rec.direction == "BEARISH"):
-                    rec.confidence = min(rec.confidence * 1.15, 0.95)
+                    rec.confidence = min(rec.confidence * 1.15, 0.95)  # boost aligned flow
                 elif (dominant_side == "CALLS" and rec.direction == "BEARISH") or \
                      (dominant_side == "PUTS" and rec.direction == "BULLISH"):
-                    rec.confidence = rec.confidence * 0.85
+                    rec.confidence = rec.confidence * 0.85  # penalize counter-flow
 
+            # FIX #5: Apply ML confidence blending after all heuristic adjustments
             _apply_ml_confidence(
                 rec,
                 regime_map[ticker],
@@ -429,6 +407,9 @@ def run_nightly_scan(
                 rs_map.get(ticker),
             )
 
+            # P1 FIX #5b: After ML blending, re-enforce LONG_OPTION_MIN_CONFIDENCE.
+            # ML may lower confidence below the minimum threshold for long options;
+            # downgrade back to the base spread strategy in that case.
             if rec.strategy.value in ("LONG_CALL", "LONG_PUT") and \
                     rec.confidence < LONG_OPTION_MIN_CONFIDENCE:
                 original_strat = (
@@ -446,17 +427,24 @@ def run_nightly_scan(
 
             recommendations.append(rec)
 
+    # ── VIX Tier Overlay ──────────────────────────────────────────────────────
+    # DEFENSIVE mode: strip all directional recs, keep only NEUTRAL.
+    # CAUTION mode: keep credit strategies and NEUTRAL only.
     if market_ctx.vix_tier == "DEFENSIVE":
         before = len(recommendations)
         recommendations = [r for r in recommendations if r.direction == "NEUTRAL"]
-        logger.info(f"  DEFENSIVE filter: {before} → {len(recommendations)} neutral-only recs")
+        logger.info(
+            f"  DEFENSIVE filter: {before} → {len(recommendations)} neutral-only recs"
+        )
     elif market_ctx.vix_tier == "CAUTION":
         before = len(recommendations)
         recommendations = [
             r for r in recommendations
             if r.direction == "NEUTRAL" or getattr(r, "risk_reward", "") == "CREDIT"
         ]
-        logger.info(f"  CAUTION filter: {before} → {len(recommendations)} credit/neutral recs")
+        logger.info(
+            f"  CAUTION filter: {before} → {len(recommendations)} credit/neutral recs"
+        )
 
     recommendations.sort(key=lambda r: r.confidence, reverse=True)
     logger.info(f"  {len(recommendations)} strategy recommendations")
@@ -473,30 +461,16 @@ def run_nightly_scan(
     safe_recs = [r for r in top_for_filter if safety.get(r.ticker, None) and safety[r.ticker].safe]
     logger.info(f"  {len(safe_recs)} pass event filter")
 
-    try:
-        safe_tickers = {r.ticker for r in safe_recs}
-        for rec in recommendations:
-            candidate_row = build_candidate_feature_row(
-                ticker=rec.ticker,
-                as_of_date=scan_date,
-                recommendation=rec,
-                selected=False,
-                survived_event_filter=(rec.ticker in safe_tickers),
-                scan_mode=scan_mode,
-            )
-            write_candidate_features(scan_date, rec.ticker, [candidate_row])
-    except Exception as exc:
-        logger.warning(f"Feature store: failed to write candidate features: {exc}")
-
     # ── Step 9: Construct Trades ──────────────────────────────────────────────
     logger.info(f"Step 9: Constructing trades for top {min(len(safe_recs), 15)} candidates")
-    trades: list[dict] = []
+    trades = []
 
     for rec in safe_recs[:15]:
         ticker = rec.ticker
         price = float(qualified[ticker]["close"].iloc[-1])
 
         if dry_run:
+            # Skip real options fetching in dry_run mode
             trade_stub = _build_trade_stub(rec, qualified[ticker], regime_map, iv_map, rs_map, market_ctx, beta_map)
             _rt = rt_enrichment.get(ticker, {})
             trade_stub["context"]["options_flow"] = {
@@ -509,6 +483,7 @@ def run_nightly_scan(
             trades.append(trade_stub)
             continue
 
+        # Fetch and filter options chain
         chain = fetch_options_chain(ticker, dte_min=7, dte_max=65)
         chain = filter_liquid_options(chain)
 
@@ -532,11 +507,12 @@ def run_nightly_scan(
         }
         trades.append(trade_dict)
 
-        time.sleep(0.3)
+        time.sleep(0.3)  # Rate limiting between options fetches
 
     logger.info(f"  {len(trades)} trades constructed")
 
-    # ── Step 9b: Sector Concentration Cap ─────────────────────────────────────
+    # ── Step 9b: Sector Concentration Cap ────────────────────────────────────
+    # Never put more than MAX_PER_SECTOR picks from the same GICS sector.
     sector_counts: dict[str, int] = {}
     sector_filtered: list[dict] = []
     for t in trades:
@@ -554,19 +530,8 @@ def run_nightly_scan(
     trades = _rank_trades(trades)
     top_picks = trades[:MAX_POSITIONS]
 
-    try:
-        recommendation_rows = [
-            build_recommendation_feature_row(
-                as_of_date=scan_date,
-                pick=pick,
-                scan_mode=scan_mode,
-            )
-            for pick in top_picks
-        ]
-        write_recommendation_features(scan_date, recommendation_rows)
-    except Exception as exc:
-        logger.warning(f"Feature store: failed to write recommendation features: {exc}")
-
+    # FIX #16: Record paper trades inside run_nightly_scan() so programmatic
+    # callers (dashboard, cron) also get trade logging — not just CLI.
     if not dry_run:
         for pick in top_picks:
             _rec = pick["recommendation"]
@@ -585,6 +550,7 @@ def run_nightly_scan(
                 except Exception as e:
                     logger.warning(f"  Paper trade logging failed for {_rec['ticker']}: {e}")
 
+    # Net beta-weighted directional exposure (informational only)
     net_beta = sum(
         beta_map.get(t["recommendation"]["ticker"], 1.0)
         * (1 if t["recommendation"]["direction"] == "BULLISH" else
@@ -635,6 +601,7 @@ def run_nightly_scan(
         ],
     }
 
+    # ── Save Signal ───────────────────────────────────────────────────────────
     path = SIGNALS_DIR / f"options_signal_{scan_date}.json"
     latest = SIGNALS_DIR / "options_signal_latest.json"
     for p in [path, latest]:
@@ -644,27 +611,11 @@ def run_nightly_scan(
         except Exception as exc:
             logger.error(f"Failed to save signal to {p}: {exc}")
 
-    try:
-        write_run_metadata(scan_date, {
-            "scan_date": scan_date,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "scan_mode": scan_mode,
-            "elapsed_seconds": elapsed,
-            "universe_size": len(tickers),
-            "qualified": len(qualified),
-            "regimes_classified": len(regimes),
-            "recommendations": len(recommendations),
-            "after_event_filter": len(safe_recs),
-            "trades_constructed": len(trades),
-            "top_pick_count": len(top_picks),
-            "ibkr_enabled": IBKR_ENABLED,
-        })
-    except Exception as exc:
-        logger.warning(f"Feature store: failed to write run metadata: {exc}")
-
     logger.info(f"=== SCAN COMPLETE: {len(top_picks)} picks in {elapsed}s ===")
     return signal
 
+
+# ─── Empty Signal (VIX Halt) ─────────────────────────────────────────────────
 
 def _build_empty_signal(
     scan_date: str,
@@ -674,6 +625,10 @@ def _build_empty_signal(
     tickers: list,
     qualified: dict,
 ) -> dict:
+    """
+    Return a zero-picks signal when a circuit breaker fires (e.g. VIX liquidation).
+    Preserves full market context so operators know why no trades were generated.
+    """
     import time as _time
     elapsed = round(_time.time() - start_time, 1)
     return {
@@ -708,11 +663,14 @@ def _build_empty_signal(
     }
 
 
+# ─── Trade Construction Dispatch ─────────────────────────────────────────────
+
 def _construct_trade(rec, ticker, price, chain):
+    """Route to the appropriate strategy constructor."""
     strategy = rec.strategy
     dte = rec.target_dte
 
-    from config.settings import IC_WING_DELTA, DEFAULT_DTE_LONG_OPTION
+    from config.settings import DEFAULT_SPREAD_WIDTH, IC_WING_DELTA
 
     if strategy == StrategyType.BULL_PUT_SPREAD:
         return construct_bull_put_spread(ticker, price, chain, target_dte=dte)
@@ -727,31 +685,40 @@ def _construct_trade(rec, ticker, price, chain):
         return construct_bear_put_spread(ticker, price, chain, target_dte=dte)
 
     elif strategy == StrategyType.IRON_CONDOR:
-        return construct_iron_condor(ticker, price, chain, target_dte=dte, wing_delta=IC_WING_DELTA)
+        return construct_iron_condor(ticker, price, chain,
+                                     target_dte=dte, wing_delta=IC_WING_DELTA)
 
     elif strategy == StrategyType.LONG_BUTTERFLY:
         return construct_long_butterfly(ticker, price, chain, target_dte=dte)
 
     elif strategy == StrategyType.LONG_CALL:
-        return construct_long_call(ticker, price, chain, target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
+        from config.settings import DEFAULT_DTE_LONG_OPTION
+        return construct_long_call(ticker, price, chain,
+                                   target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
 
     elif strategy == StrategyType.LONG_PUT:
-        return construct_long_put(ticker, price, chain, target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
+        from config.settings import DEFAULT_DTE_LONG_OPTION
+        return construct_long_put(ticker, price, chain,
+                                  target_dte=rec.target_dte or DEFAULT_DTE_LONG_OPTION)
 
     return None
 
 
 def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, price,
                       market_ctx=None, beta_map=None):
+    """Convert trade object + recommendation into a signal dict."""
     regime = regime_map[ticker]
     iv = iv_map[ticker]
     rs = rs_map.get(ticker)
 
+    # Serialize trade object (varies by type)
     trade_data = vars(trade_obj)
+    # Remove non-serialisable nested objects (wing CreditSpreads in IC)
     for k, v in list(trade_data.items()):
         if hasattr(v, "__dict__"):
             trade_data[k] = vars(v)
 
+    # Market snapshot for ML features / audit trail
     market_snapshot: dict = {}
     if market_ctx is not None:
         market_snapshot = {
@@ -813,7 +780,9 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
                 "rs_rank": rs.rs_rank if rs else None,
                 "rs_trend": rs.rs_trend if rs else None,
             },
+            # ── V3: TA signals from levels + patterns ────────────────────────────────
             "ta_signals": getattr(regime, "ta_signals", {}),
+            # ── V3: Long option metadata ─────────────────────────────────────────
             "is_long_option": rec.strategy.value in ("LONG_CALL", "LONG_PUT"),
         },
     }
@@ -821,6 +790,7 @@ def _build_trade_dict(rec, trade_obj, data, regime_map, iv_map, rs_map, ticker, 
 
 def _build_trade_stub(rec, df, regime_map, iv_map, rs_map,
                       market_ctx=None, beta_map=None):
+    """Build a placeholder trade dict for dry_run mode."""
     ticker = rec.ticker
     price = float(df["close"].iloc[-1]) if not df.empty else 0
 
@@ -856,6 +826,8 @@ def _build_trade_stub(rec, df, regime_map, iv_map, rs_map,
             "market_snapshot": market_snapshot,
             "regime_detail": vars(regime_map[ticker]) if ticker in regime_map else {},
             "iv_detail": vars(iv_map[ticker]) if ticker in iv_map else {},
+            # FIX #4: Include rs_detail, ta_signals, and is_long_option in dry-run stubs
+            # so the dashboard TA Signals expander and long-option info box work in dry-run.
             "rs_detail": {
                 "rs_vs_spy": rs_map[ticker].rs_vs_spy if ticker in rs_map else None,
                 "rs_rank": rs_map[ticker].rs_rank if ticker in rs_map else None,
@@ -868,7 +840,14 @@ def _build_trade_stub(rec, df, regime_map, iv_map, rs_map,
 
 
 def _rank_trades(trades: list[dict]) -> list[dict]:
-    from config.settings import MAX_SAME_DIRECTION_PCT, LONG_OPTION_MAX_ALLOCATION_PCT
+    """
+    Rank trades by composite score and assign priority.
+
+    V2: Enforces directional balance — no more than MAX_SAME_DIRECTION_PCT
+    of MAX_POSITIONS slots may be filled by the same direction (BULLISH/BEARISH).
+    Neutral (iron condors, butterflies) are never limited.
+    """
+    from config.settings import MAX_SAME_DIRECTION_PCT
 
     for t in trades:
         trade = t.get("trade", {})
@@ -879,12 +858,17 @@ def _rank_trades(trades: list[dict]) -> list[dict]:
         rr = float(trade.get("risk_reward_ratio", 3.0))
         ev = float(trade.get("ev", 0.0))
 
+        # Composite = confidence × (PoP/100) × (1/RR) × ev_bonus
         ev_bonus = 1.0 + max(ev / 100, 0)
         composite = conf * (pop / 100) * (1 / max(rr, 0.5)) * ev_bonus
+
         t["composite_score"] = round(composite, 4)
 
     trades.sort(key=lambda t: t.get("composite_score", 0), reverse=True)
 
+    # ── V2: Directional balance gate ────────────────────────────────────────
+    # Cap the number of same-direction trades at MAX_SAME_DIRECTION_PCT% of
+    # MAX_POSITIONS so we never run 4 bear spreads + 1 bull spread again.
     max_same_dir = max(2, int(MAX_POSITIONS * MAX_SAME_DIRECTION_PCT / 100))
     balanced = []
     direction_counts: dict[str, int] = {"BULLISH": 0, "BEARISH": 0, "NEUTRAL": 0}
@@ -903,6 +887,11 @@ def _rank_trades(trades: list[dict]) -> list[dict]:
                 f"{current_count}/{max_same_dir} {direction} slots filled"
             )
 
+    # ── V3: Long-option allocation cap ─────────────────────────────────────
+    # No more than LONG_OPTION_MAX_ALLOCATION_PCT% of MAX_POSITIONS may be
+    # directional long options (they carry 100% premium-loss risk vs. capped
+    # spread risk, so we keep them to a minority of the book).
+    from config.settings import LONG_OPTION_MAX_ALLOCATION_PCT
     max_long_option_slots = max(1, int(MAX_POSITIONS * LONG_OPTION_MAX_ALLOCATION_PCT / 100))
     long_option_count = 0
     capped: list[dict] = []
@@ -927,6 +916,7 @@ def _rank_trades(trades: list[dict]) -> list[dict]:
 
 
 def _adjust_confidence_for_rs(rec, rs) -> None:
+    """Boost/reduce confidence based on relative strength alignment."""
     if rec.direction == "BULLISH" and rs.outperforming_spy and rs.rs_trend == "IMPROVING":
         rec.confidence = min(rec.confidence + 0.05, 1.0)
     elif rec.direction == "BEARISH" and not rs.outperforming_spy and rs.rs_trend == "WEAKENING":
@@ -934,6 +924,8 @@ def _adjust_confidence_for_rs(rec, rs) -> None:
     elif rec.direction == "BULLISH" and not rs.outperforming_spy:
         rec.confidence = max(rec.confidence - 0.05, 0.0)
 
+
+# ─── Entry Point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
@@ -972,6 +964,8 @@ if __name__ == "__main__":
                 print(f"   Credit: ${credit} | Max Risk: ${max_r} | PoP: {pop}%")
         print(f"   {rec['rationale']}")
 
+        # Trade logging already handled inside run_nightly_scan() — P0 FIX #1:
+        # avoid double record_entry when running from CLI.
         if not trade.get("dry_run") and pick.get("trade_id"):
             print(f"   📝 Trade logged: {pick['trade_id']}")
     print()
