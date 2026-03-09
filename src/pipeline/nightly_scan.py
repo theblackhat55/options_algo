@@ -378,13 +378,12 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
         return rec
 
     direction = _extract_direction(rec)
-    strategy = _extract_strategy(rec)
+    original_strategy = _extract_strategy(rec)
 
-    # Phase 3B.2: confidence / score adjustment
     adj = analyze_surface_adjustment(
         ticker=ticker,
         direction=direction,
-        strategy=strategy,
+        strategy=original_strategy,
         surface_row=surface_row,
     )
 
@@ -413,21 +412,22 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
     except Exception:
         pass
 
-    # Phase 3B.3: strategy bias
     bias = choose_strategy_bias(
         ticker=ticker,
         direction=direction,
-        strategy=strategy,
+        strategy=original_strategy,
         surface_row=surface_row,
     )
 
     bias_conf_delta = _safe_float(getattr(bias, "confidence_delta", 0.0), 0.0)
     bias_score_delta = _safe_float(getattr(bias, "candidate_score_delta", 0.0), 0.0)
-    preferred_strategy = _safe_str(getattr(bias, "preferred_strategy", strategy), strategy)
+    preferred_strategy = _safe_str(getattr(bias, "preferred_strategy", original_strategy), original_strategy)
     bias_notes = _safe_str(getattr(bias, "rationale", ""), "")
+    strategy_changed = bool(getattr(bias, "strategy_changed", False))
+    bias_strength = _safe_str(getattr(bias, "bias_strength", ""), "")
 
     try:
-        if preferred_strategy:
+        if strategy_changed and preferred_strategy:
             rec.strategy = preferred_strategy
     except Exception:
         pass
@@ -464,7 +464,11 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
         rec.surface_confidence_delta = conf_delta + bias_conf_delta
         rec.surface_candidate_score_delta = score_delta + bias_score_delta
         rec.surface_adjustment_notes = ";".join([p for p in [adj_notes, bias_notes] if p])
+        rec.surface_original_strategy = original_strategy
         rec.surface_preferred_strategy = preferred_strategy
+        rec.surface_strategy_changed = strategy_changed
+        rec.surface_bias_strength = bias_strength
+        rec.surface_bias_rationale = bias_notes
     except Exception:
         pass
 
@@ -619,7 +623,11 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                         "surface_confidence_delta": _safe_float(_extract_attr(trade, "surface_confidence_delta", 0.0), 0.0),
                         "surface_candidate_score_delta": _safe_float(_extract_attr(trade, "surface_candidate_score_delta", 0.0), 0.0),
                         "surface_adjustment_notes": _safe_str(_extract_attr(trade, "surface_adjustment_notes", ""), ""),
+                        "surface_original_strategy": _safe_str(_extract_attr(trade, "surface_original_strategy", ""), ""),
                         "surface_preferred_strategy": _safe_str(_extract_attr(trade, "surface_preferred_strategy", ""), ""),
+                        "surface_strategy_changed": bool(_extract_attr(trade, "surface_strategy_changed", False)),
+                        "surface_bias_strength": _safe_str(_extract_attr(trade, "surface_bias_strength", ""), ""),
+                        "surface_bias_rationale": _safe_str(_extract_attr(trade, "surface_bias_rationale", ""), ""),
                         "sector": _extract_sector(trade),
                         "price": _extract_price(trade),
                     },
@@ -759,7 +767,11 @@ class _SimpleRec:
         self.surface_confidence_delta = 0.0
         self.surface_candidate_score_delta = 0.0
         self.surface_adjustment_notes = ""
+        self.surface_original_strategy = ""
         self.surface_preferred_strategy = ""
+        self.surface_strategy_changed = False
+        self.surface_bias_strength = ""
+        self.surface_bias_rationale = ""
 
 
 def _fallback_recommendations(classified: Dict[str, Any]) -> List[Any]:

@@ -204,6 +204,11 @@ def build_candidate_feature_row(
                 "surface_confidence_delta": 0.0,
                 "surface_candidate_score_delta": 0.0,
                 "surface_adjustment_notes": "",
+                "surface_original_strategy": "",
+                "surface_preferred_strategy": "",
+                "surface_strategy_changed": False,
+                "surface_bias_strength": "",
+                "surface_bias_rationale": "",
             }
         )
         return row
@@ -224,6 +229,11 @@ def build_candidate_feature_row(
             "surface_confidence_delta": _safe_float(_extract(candidate, "surface_confidence_delta", 0.0), 0.0),
             "surface_candidate_score_delta": _safe_float(_extract(candidate, "surface_candidate_score_delta", 0.0), 0.0),
             "surface_adjustment_notes": _safe_str(_extract(candidate, "surface_adjustment_notes", ""), ""),
+            "surface_original_strategy": _safe_str(_extract(candidate, "surface_original_strategy", ""), ""),
+            "surface_preferred_strategy": _safe_str(_extract(candidate, "surface_preferred_strategy", ""), ""),
+            "surface_strategy_changed": bool(_extract(candidate, "surface_strategy_changed", False)),
+            "surface_bias_strength": _safe_str(_extract(candidate, "surface_bias_strength", ""), ""),
+            "surface_bias_rationale": _safe_str(_extract(candidate, "surface_bias_rationale", ""), ""),
         }
     )
     return row
@@ -252,6 +262,11 @@ def build_recommendation_feature_row(
                 "surface_confidence_delta": 0.0,
                 "surface_candidate_score_delta": 0.0,
                 "surface_adjustment_notes": "",
+                "surface_original_strategy": "",
+                "surface_preferred_strategy": "",
+                "surface_strategy_changed": False,
+                "surface_bias_strength": "",
+                "surface_bias_rationale": "",
             }
         )
         return row
@@ -270,6 +285,11 @@ def build_recommendation_feature_row(
             "surface_confidence_delta": _safe_float(_extract(recommendation, "surface_confidence_delta", 0.0), 0.0),
             "surface_candidate_score_delta": _safe_float(_extract(recommendation, "surface_candidate_score_delta", 0.0), 0.0),
             "surface_adjustment_notes": _safe_str(_extract(recommendation, "surface_adjustment_notes", ""), ""),
+            "surface_original_strategy": _safe_str(_extract(recommendation, "surface_original_strategy", ""), ""),
+            "surface_preferred_strategy": _safe_str(_extract(recommendation, "surface_preferred_strategy", ""), ""),
+            "surface_strategy_changed": bool(_extract(recommendation, "surface_strategy_changed", False)),
+            "surface_bias_strength": _safe_str(_extract(recommendation, "surface_bias_strength", ""), ""),
+            "surface_bias_rationale": _safe_str(_extract(recommendation, "surface_bias_rationale", ""), ""),
         }
     )
     return row

@@ -25,9 +25,12 @@ def _safe_str(value: Any, default: str = "") -> str:
 @dataclass
 class StrategyBiasDecision:
     ticker: str
+    original_strategy: str
     preferred_strategy: str
+    strategy_changed: bool
     confidence_delta: float
     candidate_score_delta: float
+    bias_strength: str
     rationale: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -42,7 +45,7 @@ def choose_strategy_bias(
 ) -> StrategyBiasDecision:
     row = surface_row or {}
     direction = _safe_str(direction).upper()
-    strategy_u = _safe_str(strategy).upper()
+    original = _safe_str(strategy).upper() or "WATCHLIST"
 
     liq_ratio = _safe_float(row.get("surface_liquid_contract_ratio", 0.0), 0.0)
     avg_spread = _safe_float(row.get("surface_avg_spread_pct", 0.0), 0.0)
@@ -55,7 +58,8 @@ def choose_strategy_bias(
     front_conc = _safe_float(row.get("surface_front_expiry_concentration", 0.0), 0.0)
     total_contracts = _safe_float(row.get("surface_total_contracts", 0.0), 0.0)
 
-    liquid = liq_ratio >= 0.25 and avg_spread <= 0.15 and median_spread <= 0.10
+    liquid_ok = liq_ratio >= 0.25 and avg_spread <= 0.15 and median_spread <= 0.10
+    liquid_strong = liq_ratio >= 0.45 and avg_spread <= 0.08 and median_spread <= 0.06
     long_vega_friendly = term_slope > 0.0 or term_ratio > 1.0
     short_premium_friendly = term_slope < 0.0 or (0.0 < term_ratio < 1.0)
     put_heavy = pc_oi >= 1.25 or pc_vol >= 1.25
@@ -63,72 +67,77 @@ def choose_strategy_bias(
     pin_risk = top_oi_dist <= 0.02 and total_contracts > 0
     crowded_front = front_conc >= 0.60
 
-    preferred = strategy_u
+    preferred = original
     conf_delta = 0.0
     score_delta = 0.0
     reasons = []
+    bias_strength = "NONE"
 
-    # Neutral pin / crowding preference
-    if pin_risk and direction == "NEUTRAL":
+    # Only allow actual overrides when evidence is fairly strong.
+    if liquid_ok and crowded_front and pin_risk and direction == "NEUTRAL":
         preferred = "IRON_CONDOR"
-        conf_delta += 0.03
-        score_delta += 0.03
-        reasons.append("pin_risk_prefers_neutral_structure")
+        conf_delta += 0.02
+        score_delta += 0.02
+        reasons.append("strong_neutral_pin_setup")
+        bias_strength = "STRONG"
 
-    # Strong short-premium setup
-    elif liquid and short_premium_friendly and crowded_front:
+    elif liquid_strong and short_premium_friendly:
         if direction == "NEUTRAL":
             preferred = "IRON_CONDOR"
         elif direction == "BULLISH":
             preferred = "BULL_PUT_SPREAD"
         elif direction == "BEARISH":
             preferred = "BEAR_CALL_SPREAD"
-        conf_delta += 0.03
-        score_delta += 0.04
-        reasons.append("liquid_short_premium_setup")
+        if preferred != original:
+            conf_delta += 0.02
+            score_delta += 0.03
+            reasons.append("strong_short_premium_setup")
+            bias_strength = "STRONG"
 
-    # Strong long-vega setup
-    elif liquid and long_vega_friendly:
+    elif liquid_strong and long_vega_friendly:
         if direction == "BULLISH":
             preferred = "LONG_CALL"
         elif direction == "BEARISH":
             preferred = "LONG_PUT"
         elif direction == "NEUTRAL":
             preferred = "LONG_BUTTERFLY"
-        conf_delta += 0.02
-        score_delta += 0.03
-        reasons.append("liquid_long_vega_setup")
+        if preferred != original:
+            conf_delta += 0.01
+            score_delta += 0.02
+            reasons.append("strong_long_vega_setup")
+            bias_strength = "MEDIUM"
 
-    # Positioning reinforcement
-    if direction == "BULLISH" and call_heavy:
-        if preferred in {"WATCHLIST", "", strategy_u}:
-            preferred = "BULL_PUT_SPREAD" if liquid else strategy_u or "WATCHLIST"
-        conf_delta += 0.01
-        score_delta += 0.01
-        reasons.append("call_heavy_supports_bullish")
+    # If no strong override, allow only gentle reinforcement of an already-compatible strategy.
+    if preferred == original:
+        if direction == "BULLISH" and call_heavy:
+            conf_delta += 0.01
+            score_delta += 0.01
+            reasons.append("call_heavy_supports_bullish")
+            bias_strength = "LIGHT" if bias_strength == "NONE" else bias_strength
+        elif direction == "BEARISH" and put_heavy:
+            conf_delta += 0.01
+            score_delta += 0.01
+            reasons.append("put_heavy_supports_bearish")
+            bias_strength = "LIGHT" if bias_strength == "NONE" else bias_strength
 
-    if direction == "BEARISH" and put_heavy:
-        if preferred in {"WATCHLIST", "", strategy_u}:
-            preferred = "BEAR_CALL_SPREAD" if liquid else strategy_u or "WATCHLIST"
-        conf_delta += 0.01
-        score_delta += 0.01
-        reasons.append("put_heavy_supports_bearish")
+    # Poor liquidity should discourage changing strategy, not force a generic one.
+    if total_contracts > 0 and not liquid_ok and preferred != original:
+        preferred = original
+        conf_delta = min(conf_delta, 0.0)
+        score_delta = min(score_delta, 0.0)
+        reasons.append("poor_liquidity_blocked_override")
+        bias_strength = "LIGHT"
 
-    # Poor liquidity discourages aggressive long-vega changes
-    if total_contracts > 0 and not liquid:
-        if preferred in {"LONG_CALL", "LONG_PUT", "LONG_BUTTERFLY"}:
-            preferred = strategy_u or "WATCHLIST"
-        conf_delta -= 0.03
-        score_delta -= 0.03
-        reasons.append("poor_liquidity_caps_strategy_bias")
-
-    conf_delta = max(-0.08, min(0.08, conf_delta))
-    score_delta = max(-0.08, min(0.08, score_delta))
+    conf_delta = max(-0.05, min(0.05, conf_delta))
+    score_delta = max(-0.05, min(0.05, score_delta))
 
     return StrategyBiasDecision(
         ticker=ticker,
-        preferred_strategy=preferred or (strategy_u or "WATCHLIST"),
+        original_strategy=original,
+        preferred_strategy=preferred or original,
+        strategy_changed=(preferred or original) != original,
         confidence_delta=conf_delta,
         candidate_score_delta=score_delta,
+        bias_strength=bias_strength,
         rationale=";".join(reasons),
     )

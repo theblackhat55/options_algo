@@ -26,6 +26,7 @@ def _safe_str(value: Any, default: str = "") -> str:
 class SurfaceAdjustment:
     ticker: str
     liquidity_ok: bool
+    liquidity_quality: str
     crowded_front: bool
     put_heavy: bool
     call_heavy: bool
@@ -63,7 +64,22 @@ def analyze_surface_adjustment(
     direction = _safe_str(direction).upper()
     strategy_u = _safe_str(strategy).upper()
 
-    liquidity_ok = liq_ratio >= 0.25 and avg_spread <= 0.15 and median_spread <= 0.10
+    long_vega_keywords = ("LONG_CALL", "LONG_PUT", "LONG_STRADDLE", "LONG_STRANGLE", "LONG_BUTTERFLY", "BUTTERFLY")
+    short_premium_keywords = ("IRON_CONDOR", "CREDIT", "SHORT", "VERTICAL", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD")
+
+    # Liquidity quality bucket: use one bucket instead of stacking many penalties
+    if total_contracts <= 0:
+        liquidity_quality = "UNKNOWN"
+    elif liq_ratio >= 0.45 and avg_spread <= 0.08 and median_spread <= 0.06:
+        liquidity_quality = "STRONG"
+    elif liq_ratio >= 0.25 and avg_spread <= 0.15 and median_spread <= 0.10:
+        liquidity_quality = "OK"
+    elif liq_ratio >= 0.12 and avg_spread <= 0.25 and median_spread <= 0.18:
+        liquidity_quality = "WEAK"
+    else:
+        liquidity_quality = "POOR"
+
+    liquidity_ok = liquidity_quality in {"STRONG", "OK"}
     crowded_front = front_conc >= 0.60
     put_heavy = pc_oi >= 1.25 or pc_vol >= 1.25
     call_heavy = (0.0 < pc_oi <= 0.80) or (0.0 < pc_vol <= 0.80)
@@ -75,44 +91,43 @@ def analyze_surface_adjustment(
     candidate_score_delta = 0.0
     notes = []
 
-    # Liquidity rules
-    if total_contracts > 0:
-        if liq_ratio < 0.25:
-            confidence_delta -= 0.07
-            candidate_score_delta -= 0.05
-            notes.append("poor_liquidity_ratio")
-        if avg_spread > 0.15:
-            confidence_delta -= 0.05
-            candidate_score_delta -= 0.03
-            notes.append("wide_avg_spread")
-        if median_spread > 0.10:
-            candidate_score_delta -= 0.03
-            notes.append("wide_median_spread")
+    # Liquidity bucket penalties/boosts: only one main bucket applied
+    if liquidity_quality == "STRONG":
+        candidate_score_delta += 0.02
+        notes.append("strong_liquidity")
+    elif liquidity_quality == "OK":
+        candidate_score_delta += 0.01
+        notes.append("acceptable_liquidity")
+    elif liquidity_quality == "WEAK":
+        confidence_delta -= 0.02
+        candidate_score_delta -= 0.02
+        notes.append("weak_liquidity")
+    elif liquidity_quality == "POOR":
+        confidence_delta -= 0.04
+        candidate_score_delta -= 0.04
+        notes.append("poor_liquidity")
 
-    # Directional positioning
+    # Directional positioning: gentle adjustments
     if direction == "BULLISH":
         if call_heavy:
-            confidence_delta += 0.03
+            confidence_delta += 0.02
             notes.append("bullish_call_positioning")
         elif put_heavy:
-            confidence_delta -= 0.03
+            confidence_delta -= 0.02
             notes.append("bearish_put_positioning_against_bull")
     elif direction == "BEARISH":
         if put_heavy:
-            confidence_delta += 0.03
+            confidence_delta += 0.02
             notes.append("bearish_put_positioning")
         elif call_heavy:
-            confidence_delta -= 0.03
+            confidence_delta -= 0.02
             notes.append("bullish_call_positioning_against_bear")
 
     # Strategy-aware term structure
-    long_vega_keywords = ("LONG_CALL", "LONG_PUT", "LONG_STRADDLE", "LONG_STRANGLE", "BUTTERFLY")
-    short_premium_keywords = ("IRON_CONDOR", "CREDIT", "SHORT", "VERTICAL")
-
     if any(k in strategy_u for k in long_vega_keywords):
         if long_vega_friendly:
             confidence_delta += 0.02
-            candidate_score_delta += 0.02
+            candidate_score_delta += 0.01
             notes.append("term_structure_supports_long_vega")
         elif short_premium_friendly:
             confidence_delta -= 0.02
@@ -121,25 +136,26 @@ def analyze_surface_adjustment(
     if any(k in strategy_u for k in short_premium_keywords):
         if short_premium_friendly:
             confidence_delta += 0.02
-            candidate_score_delta += 0.02
+            candidate_score_delta += 0.01
             notes.append("term_structure_supports_short_premium")
         elif long_vega_friendly:
             confidence_delta -= 0.02
             notes.append("term_structure_unfavorable_short_premium")
 
-    # Neutral pinning / crowding
-    if neutral_pin_risk and direction == "NEUTRAL":
+    # Neutral pinning / concentration: make more selective
+    if neutral_pin_risk and crowded_front and direction == "NEUTRAL" and liquidity_ok:
         confidence_delta += 0.02
+        candidate_score_delta += 0.01
         notes.append("neutral_pin_support")
     elif neutral_pin_risk and direction in {"BULLISH", "BEARISH"}:
-        confidence_delta -= 0.02
+        confidence_delta -= 0.01
         notes.append("pin_risk_against_directional")
 
-    if crowded_front:
+    if crowded_front and not liquidity_ok:
         candidate_score_delta -= 0.01
-        notes.append("crowded_front_expiry")
+        notes.append("crowded_front_with_weak_liquidity")
 
-    # Skew proxy mild context
+    # Skew proxy
     if skew_proxy > 0.05 and direction == "BEARISH":
         confidence_delta += 0.01
         notes.append("put_skew_supports_bearish")
@@ -147,13 +163,13 @@ def analyze_surface_adjustment(
         confidence_delta -= 0.01
         notes.append("put_skew_against_bullish")
 
-    # Clamp
-    confidence_delta = max(-0.12, min(0.12, confidence_delta))
-    candidate_score_delta = max(-0.10, min(0.10, candidate_score_delta))
+    confidence_delta = max(-0.08, min(0.08, confidence_delta))
+    candidate_score_delta = max(-0.08, min(0.08, candidate_score_delta))
 
     return SurfaceAdjustment(
         ticker=ticker,
         liquidity_ok=liquidity_ok,
+        liquidity_quality=liquidity_quality,
         crowded_front=crowded_front,
         put_heavy=put_heavy,
         call_heavy=call_heavy,
