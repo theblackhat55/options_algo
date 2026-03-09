@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+from src.analysis.options_strategy_bias import choose_strategy_bias
 from src.analysis.options_surface_signals import analyze_surface_adjustment
 from src.features.builders import (
     build_candidate_feature_row,
@@ -23,10 +24,6 @@ from src.features.builders import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-
-# -----------------------------------------------------------------------------
-# Optional imports with safe fallbacks
-# -----------------------------------------------------------------------------
 
 def _optional_import(module_name: str, attr: str, default: Any = None) -> Any:
     try:
@@ -45,10 +42,6 @@ fetch_options_chain = _optional_import("src.data.options_fetcher", "fetch_option
 filter_liquid_options = _optional_import("src.analysis.options_liquidity", "filter_liquid_options", None)
 generate_candidates = _optional_import("src.strategy.selector", "generate_candidates", None)
 
-
-# -----------------------------------------------------------------------------
-# Basic utils
-# -----------------------------------------------------------------------------
 
 def _today_str() -> str:
     return str(date.today())
@@ -174,10 +167,6 @@ def _extract_candidate_score(obj: Any) -> float:
 def _extract_price(obj: Any) -> float:
     return _safe_float(_extract_attr(obj, "price", _extract_attr(obj, "current_price", 0.0)), 0.0)
 
-
-# -----------------------------------------------------------------------------
-# Compatibility helpers
-# -----------------------------------------------------------------------------
 
 def _coerce_universe_to_list(universe_data: Any) -> List[Any]:
     if universe_data is None:
@@ -365,10 +354,6 @@ def _safe_filter_liquid_options(chain: pd.DataFrame) -> pd.DataFrame:
         return chain
 
 
-# -----------------------------------------------------------------------------
-# Surface feature loading / adjustment
-# -----------------------------------------------------------------------------
-
 def _load_options_surface_row(ticker: str, scan_date: str) -> Dict[str, Any]:
     path = Path(f"data/features/options/ticker={ticker}/date={scan_date}.parquet")
     if not path.exists():
@@ -395,6 +380,7 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
     direction = _extract_direction(rec)
     strategy = _extract_strategy(rec)
 
+    # Phase 3B.2: confidence / score adjustment
     adj = analyze_surface_adjustment(
         ticker=ticker,
         direction=direction,
@@ -402,47 +388,90 @@ def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
         surface_row=surface_row,
     )
 
+    conf_delta = _safe_float(getattr(adj, "confidence_delta", 0.0), 0.0)
+    score_delta = _safe_float(getattr(adj, "candidate_score_delta", 0.0), 0.0)
+    adj_notes = _safe_str(getattr(adj, "notes", ""), "")
+
     try:
         base_conf = _extract_confidence(rec)
-        new_conf = max(0.0, min(1.0, base_conf + _safe_float(adj.confidence_delta, 0.0)))
-        rec.confidence = new_conf
+        rec.confidence = max(0.0, min(1.0, base_conf + conf_delta))
     except Exception:
         pass
 
     try:
         base_score = _safe_float(_extract_attr(rec, "candidate_score", _extract_attr(rec, "cand_score", 0.0)), 0.0)
-        new_score = max(0.0, min(1.0, base_score + _safe_float(adj.candidate_score_delta, 0.0)))
+        new_score = max(0.0, min(1.0, base_score + score_delta))
         if hasattr(rec, "candidate_score"):
             rec.candidate_score = new_score
         elif hasattr(rec, "cand_score"):
             rec.cand_score = new_score
+        else:
+            try:
+                setattr(rec, "candidate_score", new_score)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Phase 3B.3: strategy bias
+    bias = choose_strategy_bias(
+        ticker=ticker,
+        direction=direction,
+        strategy=strategy,
+        surface_row=surface_row,
+    )
+
+    bias_conf_delta = _safe_float(getattr(bias, "confidence_delta", 0.0), 0.0)
+    bias_score_delta = _safe_float(getattr(bias, "candidate_score_delta", 0.0), 0.0)
+    preferred_strategy = _safe_str(getattr(bias, "preferred_strategy", strategy), strategy)
+    bias_notes = _safe_str(getattr(bias, "rationale", ""), "")
+
+    try:
+        if preferred_strategy:
+            rec.strategy = preferred_strategy
+    except Exception:
+        pass
+
+    try:
+        base_conf2 = _extract_confidence(rec)
+        rec.confidence = max(0.0, min(1.0, base_conf2 + bias_conf_delta))
+    except Exception:
+        pass
+
+    try:
+        base_score2 = _safe_float(_extract_attr(rec, "candidate_score", _extract_attr(rec, "cand_score", 0.0)), 0.0)
+        new_score2 = max(0.0, min(1.0, base_score2 + bias_score_delta))
+        if hasattr(rec, "candidate_score"):
+            rec.candidate_score = new_score2
+        elif hasattr(rec, "cand_score"):
+            rec.cand_score = new_score2
+        else:
+            try:
+                setattr(rec, "candidate_score", new_score2)
+            except Exception:
+                pass
     except Exception:
         pass
 
     try:
         prior_notes = _safe_str(_extract_attr(rec, "notes", ""), "")
-        extra = _safe_str(adj.notes, "")
-        merged = prior_notes
-        if extra:
-            merged = f"{prior_notes};{extra}".strip(";") if prior_notes else extra
-        rec.notes = merged
+        parts = [p for p in [prior_notes, adj_notes, bias_notes] if p]
+        rec.notes = ";".join(parts)
+    except Exception:
+        pass
+
+    try:
+        rec.surface_confidence_delta = conf_delta + bias_conf_delta
+        rec.surface_candidate_score_delta = score_delta + bias_score_delta
+        rec.surface_adjustment_notes = ";".join([p for p in [adj_notes, bias_notes] if p])
+        rec.surface_preferred_strategy = preferred_strategy
     except Exception:
         pass
 
     return rec
 
 
-# -----------------------------------------------------------------------------
-# Test-compat helpers expected by suite
-# -----------------------------------------------------------------------------
-
 def _build_trade_stub(*args):
-    """
-    Backward-compatible signatures supported:
-      _build_trade_stub(rec, df, regimes, iv_map, rs_map, market_ctx, beta_map)
-      _build_trade_stub(rec, market_ctx, beta_map)
-      _build_trade_stub(rec, ...)
-    """
     rec = args[0] if len(args) > 0 else None
     market_ctx = None
     beta_map = {}
@@ -493,11 +522,6 @@ def _build_trade_stub(*args):
 
 
 def _adjust_confidence_for_rs(*args):
-    """
-    Supports:
-      - _adjust_confidence_for_rs(recommendation, rs_data)
-      - _adjust_confidence_for_rs(base_confidence, direction, rs_data)
-    """
     def _coerce_outperforming(rs_data: Any) -> bool:
         if rs_data is None:
             return False
@@ -557,10 +581,11 @@ def _compute_composite_score(trade: Any) -> float:
         rec = trade.get("recommendation", {})
         trade_metrics = trade.get("trade", {})
         confidence = _safe_float(rec.get("confidence", 0.0), 0.0)
+        candidate_score = _safe_float(rec.get("candidate_score", 0.0), 0.0)
         prob_profit = _safe_float(trade_metrics.get("prob_profit", 0.0), 0.0) / 100.0
         rr = _safe_float(trade_metrics.get("risk_reward_ratio", 0.0), 0.0)
         ev = _safe_float(trade_metrics.get("ev", 0.0), 0.0)
-        return confidence + prob_profit * 0.2 + rr * 0.05 + ev * 0.01
+        return confidence + candidate_score + prob_profit * 0.2 + rr * 0.05 + ev * 0.01
 
     return _extract_candidate_score(trade) + _extract_confidence(trade)
 
@@ -573,6 +598,10 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
         if isinstance(trade, dict):
             item = dict(trade)
             item["composite_score"] = _safe_float(item.get("composite_score", _compute_composite_score(item)), 0.0)
+            item.setdefault("recommendation", {})
+            item["recommendation"]["confidence"] = _safe_float(item["recommendation"].get("confidence", 0.0), 0.0)
+            item["recommendation"]["candidate_score"] = _safe_float(item["recommendation"].get("candidate_score", 0.0), 0.0)
+            item["recommendation"]["notes"] = _safe_str(item["recommendation"].get("notes", ""), "")
             enriched.append(item)
         else:
             enriched.append(
@@ -586,6 +615,13 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                             _extract_attr(trade, "candidate_score", _extract_attr(trade, "cand_score", 0.0)),
                             0.0,
                         ),
+                        "notes": _safe_str(_extract_attr(trade, "notes", ""), ""),
+                        "surface_confidence_delta": _safe_float(_extract_attr(trade, "surface_confidence_delta", 0.0), 0.0),
+                        "surface_candidate_score_delta": _safe_float(_extract_attr(trade, "surface_candidate_score_delta", 0.0), 0.0),
+                        "surface_adjustment_notes": _safe_str(_extract_attr(trade, "surface_adjustment_notes", ""), ""),
+                        "surface_preferred_strategy": _safe_str(_extract_attr(trade, "surface_preferred_strategy", ""), ""),
+                        "sector": _extract_sector(trade),
+                        "price": _extract_price(trade),
                     },
                     "trade": {},
                     "composite_score": _compute_composite_score(trade),
@@ -614,13 +650,11 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
 
     for i, item in enumerate(kept, start=1):
         item["priority"] = i
+        item["recommendation"]["priority"] = i
+        item["recommendation"]["composite_score"] = _safe_float(item.get("composite_score", 0.0), 0.0)
 
     return kept
 
-
-# -----------------------------------------------------------------------------
-# Feature writers
-# -----------------------------------------------------------------------------
 
 def _write_market_features(scan_date: str, market_ctx: Any) -> None:
     try:
@@ -661,18 +695,19 @@ def _write_candidate_features(scan_date: str, candidates: List[Any]) -> None:
     base = Path(f"data/features/candidates/scan_date={scan_date}")
     for rec in candidates:
         try:
-            ticker = _extract_ticker(rec.get("recommendation", rec) if isinstance(rec, dict) else rec)
+            base_rec = rec.get("recommendation", rec) if isinstance(rec, dict) else rec
+            ticker = _extract_ticker(base_rec)
             if not ticker:
                 continue
             row = build_candidate_feature_row(
                 ticker=ticker,
                 as_of_date=scan_date,
-                candidate=rec.get("recommendation", rec) if isinstance(rec, dict) else rec,
+                candidate=base_rec,
                 run_type="nightly_scan",
                 scan_mode="dry_run",
             )
-            row["priority"] = _safe_int(rec.get("priority", 0), 0) if isinstance(rec, dict) else 0
-            row["composite_score"] = _safe_float(rec.get("composite_score", 0.0), 0.0) if isinstance(rec, dict) else 0.0
+            row["priority"] = _safe_int(rec.get("priority", row.get("priority", 0)), 0) if isinstance(rec, dict) else _safe_int(row.get("priority", 0), 0)
+            row["composite_score"] = _safe_float(rec.get("composite_score", row.get("composite_score", 0.0)), 0.0) if isinstance(rec, dict) else _safe_float(row.get("composite_score", 0.0), 0.0)
             _write_parquet_row(base / f"{ticker}.parquet", row)
         except Exception as exc:
             logger.warning("Failed writing candidate features: %s", exc)
@@ -693,8 +728,8 @@ def _write_recommendations(scan_date: str, recommendations: List[Any]) -> None:
             scan_mode="dry_run",
         )
         if isinstance(rec, dict):
-            row["priority"] = _safe_int(rec.get("priority", 0), 0)
-            row["composite_score"] = _safe_float(rec.get("composite_score", 0.0), 0.0)
+            row["priority"] = _safe_int(rec.get("priority", row.get("priority", 0)), 0)
+            row["composite_score"] = _safe_float(rec.get("composite_score", row.get("composite_score", 0.0)), 0.0)
         rows.append(row)
 
     if not rows:
@@ -709,10 +744,6 @@ def _write_run_metadata(scan_date: str, metadata: Dict[str, Any]) -> None:
     _write_json(path, metadata)
 
 
-# -----------------------------------------------------------------------------
-# Candidate/recommendation fallbacks
-# -----------------------------------------------------------------------------
-
 class _SimpleRec:
     def __init__(self, ticker: str, price: float = 0.0, sector: str = "", direction: str = "NEUTRAL"):
         self.ticker = ticker
@@ -725,6 +756,10 @@ class _SimpleRec:
         self.composite_score = 1.00
         self.priority = 0.50
         self.notes = ""
+        self.surface_confidence_delta = 0.0
+        self.surface_candidate_score_delta = 0.0
+        self.surface_adjustment_notes = ""
+        self.surface_preferred_strategy = ""
 
 
 def _fallback_recommendations(classified: Dict[str, Any]) -> List[Any]:
@@ -742,17 +777,12 @@ def _fallback_recommendations(classified: Dict[str, Any]) -> List[Any]:
     return recs
 
 
-# -----------------------------------------------------------------------------
-# Main pipeline
-# -----------------------------------------------------------------------------
-
 def run_nightly_scan(
     dry_run: bool = False,
     universe_override: Optional[Iterable[str]] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     started = time.time()
-    completed_at = None
     scan_date = kwargs.get("scan_date", _today_str())
 
     universe_data = _call_update_universe(update_universe, universe_override)
