@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from config.settings import MAX_POSITIONS, MAX_SAME_DIRECTION_PCT
+from src.analysis.options_surface_signals import analyze_surface_adjustment
 from src.features.builders import (
     build_candidate_feature_row,
     build_market_feature_row,
@@ -258,7 +259,6 @@ def _safe_filter_tickers(universe_data: Any) -> Any:
 
 def _safe_classify_universe(universe_data: Any, market_ctx: Any = None) -> Dict[str, Any]:
     if isinstance(universe_data, dict):
-        # If this is an event-filter result map, don't treat it as classified market data.
         values = list(universe_data.values())
         if values and all(hasattr(v, "safe") or (isinstance(v, dict) and "safe" in v) for v in values):
             return {}
@@ -294,6 +294,8 @@ def _safe_market_context(universe_data: Any = None) -> Any:
             spy_5d_return = 0.0
             spy_return_5d = 0.0
             market_regime = "UNKNOWN"
+            breadth = 0.0
+            breadth_score = 0.0
         return MarketCtx()
 
     try:
@@ -310,6 +312,8 @@ def _safe_market_context(universe_data: Any = None) -> Any:
                 spy_5d_return = 0.0
                 spy_return_5d = 0.0
                 market_regime = "UNKNOWN"
+                breadth = 0.0
+                breadth_score = 0.0
             return MarketCtx()
     except Exception:
         class MarketCtx:
@@ -320,6 +324,8 @@ def _safe_market_context(universe_data: Any = None) -> Any:
             spy_5d_return = 0.0
             spy_return_5d = 0.0
             market_regime = "UNKNOWN"
+            breadth = 0.0
+            breadth_score = 0.0
         return MarketCtx()
 
 
@@ -357,6 +363,73 @@ def _safe_filter_liquid_options(chain: pd.DataFrame) -> pd.DataFrame:
         return df if isinstance(df, pd.DataFrame) else chain
     except Exception:
         return chain
+
+
+# -----------------------------------------------------------------------------
+# Surface feature loading / adjustment
+# -----------------------------------------------------------------------------
+
+def _load_options_surface_row(ticker: str, scan_date: str) -> Dict[str, Any]:
+    path = Path(f"data/features/options/ticker={ticker}/date={scan_date}.parquet")
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path)
+        if df.empty:
+            return {}
+        row = df.iloc[0].to_dict()
+        return {str(k): v for k, v in row.items()}
+    except Exception:
+        return {}
+
+
+def _apply_surface_adjustments(rec: Any, scan_date: str) -> Any:
+    ticker = _extract_ticker(rec)
+    if not ticker:
+        return rec
+
+    surface_row = _load_options_surface_row(ticker, scan_date)
+    if not surface_row:
+        return rec
+
+    direction = _extract_direction(rec)
+    strategy = _extract_strategy(rec)
+
+    adj = analyze_surface_adjustment(
+        ticker=ticker,
+        direction=direction,
+        strategy=strategy,
+        surface_row=surface_row,
+    )
+
+    try:
+        base_conf = _extract_confidence(rec)
+        new_conf = max(0.0, min(1.0, base_conf + _safe_float(adj.confidence_delta, 0.0)))
+        rec.confidence = new_conf
+    except Exception:
+        pass
+
+    try:
+        base_score = _safe_float(_extract_attr(rec, "candidate_score", _extract_attr(rec, "cand_score", 0.0)), 0.0)
+        new_score = max(0.0, min(1.0, base_score + _safe_float(adj.candidate_score_delta, 0.0)))
+        if hasattr(rec, "candidate_score"):
+            rec.candidate_score = new_score
+        elif hasattr(rec, "cand_score"):
+            rec.cand_score = new_score
+    except Exception:
+        pass
+
+    try:
+        prior_notes = _safe_str(_extract_attr(rec, "notes", ""), "")
+        extra = _safe_str(adj.notes, "")
+        merged = prior_notes
+        if extra:
+            merged = f"{prior_notes};{extra}".strip(";") if prior_notes else extra
+        rec.notes = merged
+    except Exception:
+        pass
+
+    return rec
 
 
 # -----------------------------------------------------------------------------
@@ -509,6 +582,10 @@ def _rank_trades(trades: List[Any]) -> List[Any]:
                         "direction": _extract_direction(trade),
                         "strategy": _extract_strategy(trade),
                         "confidence": _extract_confidence(trade),
+                        "candidate_score": _safe_float(
+                            _extract_attr(trade, "candidate_score", _extract_attr(trade, "cand_score", 0.0)),
+                            0.0,
+                        ),
                     },
                     "trade": {},
                     "composite_score": _compute_composite_score(trade),
@@ -675,15 +752,13 @@ def run_nightly_scan(
     **kwargs,
 ) -> Dict[str, Any]:
     started = time.time()
-    started_at = _now_iso()
+    completed_at = None
     scan_date = kwargs.get("scan_date", _today_str())
 
     universe_data = _call_update_universe(update_universe, universe_override)
     universe_size = len(universe_data) if isinstance(universe_data, dict) else len(_coerce_universe_to_list(universe_data))
 
     filtered_universe = _safe_filter_tickers(universe_data)
-
-    # If filtered result is event-filter metadata rather than real universe payload, use original universe for classification.
     classified = _safe_classify_universe(filtered_universe, None)
     if not classified:
         classified = _safe_classify_universe(universe_data, None)
@@ -703,7 +778,6 @@ def run_nightly_scan(
 
     qualified = len(classified)
 
-    # Circuit breaker
     if vix >= 45.0:
         completed_at = _now_iso()
         elapsed = round(time.time() - started, 4)
@@ -739,7 +813,6 @@ def run_nightly_scan(
         )
         return signal
 
-    # Normal flow
     for ticker, item in classified.items():
         chain = _safe_fetch_options_chain(ticker)
         liquid_chain = _safe_filter_liquid_options(chain)
@@ -766,7 +839,11 @@ def run_nightly_scan(
     if not recommendations:
         recommendations = _fallback_recommendations(classified)
 
-    ranked = _rank_trades(recommendations)
+    adjusted_recommendations: List[Any] = []
+    for rec in recommendations:
+        adjusted_recommendations.append(_apply_surface_adjustments(rec, scan_date))
+
+    ranked = _rank_trades(adjusted_recommendations)
 
     _write_candidate_features(scan_date, ranked)
     _write_recommendations(scan_date, ranked)
