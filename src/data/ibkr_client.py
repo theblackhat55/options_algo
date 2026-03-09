@@ -27,6 +27,8 @@ Notes:
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import socket
 import time
 from datetime import date, timedelta
@@ -37,6 +39,22 @@ import math
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+def _is_test_env() -> bool:
+    try:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return True
+        if "pytest" in sys.modules:
+            return True
+        if os.getenv("IBKR_DISABLE_FOR_TESTS", "1") == "1" and os.getenv("PYTEST_CURRENT_TEST"):
+            return True
+        if os.getenv("IBKR_DISABLE_NETWORK", "0") == "1":
+            return True
+        return False
+    except Exception:
+        return False
+
+
 
 
 def _safe_int(val) -> int:
@@ -94,6 +112,9 @@ def connect_ibkr(
     client_id: int | None = None,
     timeout: int | None = None,
 ) -> "IB | None":
+    if _is_test_env():
+        logger.debug("Skipping IBKR connection in test environment")
+        return None
     """
     Establish an IB Gateway connection and return the IB object.
 

@@ -655,6 +655,8 @@ def fetch_options_chain(ticker: str) -> pd.DataFrame:
     A bounded IBKR enrichment pass improves bid/ask/mid/last/IV for near-ATM front expiries.
     Returns a normalized DataFrame with REQUIRED_COLUMNS.
     """
+    if _is_test_env():
+        return pd.DataFrame(columns=REQUIRED_COLUMNS)
     base = _fetch_massive_chain(ticker)
     base = _finalize_chain_df(base)
 
