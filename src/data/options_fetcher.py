@@ -468,14 +468,16 @@ def _contract_key(expiration: Any, strike: Any, opt_type: Any) -> Tuple[str, flo
     )
 
 
-def _enrich_chain_with_ibkr(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
+def _enrich_chain_with_ibkr(ticker: str, df: pd.DataFrame, ib: Any | None = None) -> pd.DataFrame:
     if _is_test_env():
         return df
     cfg = _get_ibkr_config()
     if df.empty or not cfg.enabled:
         return df
 
-    ib = _connect_ibkr(cfg)
+    own_ib = ib is None
+    if ib is None:
+        ib = _connect_ibkr(cfg)
     if ib is None:
         return df
 
@@ -587,7 +589,8 @@ def _enrich_chain_with_ibkr(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
         return _finalize_chain_df(enriched)
 
     finally:
-        _disconnect_ibkr(ib)
+        if own_ib:
+            _disconnect_ibkr(ib)
 
 
 # ---------------------------------------------------------------------
@@ -649,7 +652,7 @@ def _finalize_chain_df(df: pd.DataFrame) -> pd.DataFrame:
 # public API
 # ---------------------------------------------------------------------
 
-def fetch_options_chain(ticker: str) -> pd.DataFrame:
+def fetch_options_chain(ticker: str, ib: Any | None = None) -> pd.DataFrame:
     """
     Base chain comes from Massive/Polygon snapshot.
     A bounded IBKR enrichment pass improves bid/ask/mid/last/IV for near-ATM front expiries.
@@ -663,7 +666,7 @@ def fetch_options_chain(ticker: str) -> pd.DataFrame:
     if base.empty:
         return base
 
-    enriched = _enrich_chain_with_ibkr(ticker, base)
+    enriched = _enrich_chain_with_ibkr(ticker, base, ib=ib)
     enriched = _finalize_chain_df(enriched)
     return enriched
 

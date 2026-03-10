@@ -64,55 +64,31 @@ def _fetch_real_vix() -> Optional[tuple[float, float]]:
     """
     Pull the latest actual VIX and VIX_SPIKE_WINDOW-day average.
 
-    Attempt order:
-        1. IBKR live VIX (real-time, most accurate during market hours).
-        2. yfinance ^VIX historical close (free, always available).
-
-    For the 5-day average we always use yfinance historical data because
-    IBKR only provides a point-in-time live value, not history.
+    Fast path:
+        1. yfinance ^VIX historical close (free, no IBKR session).
+        2. Return None on failure so caller falls back to HV proxy.
 
     Returns:
         (vix_close, vix_5d_avg) tuple, both rounded to 1 decimal.
         Returns None on any failure so the caller can fall back to the HV proxy.
     """
-    vix_live: Optional[float] = None
-
-    # ── 1. Try IBKR for the current live VIX ─────────────────────────────────
-    try:
-        from src.data.ibkr_client import connect_ibkr, disconnect_ibkr, fetch_vix_ibkr
-        ib = connect_ibkr()
-        if ib is not None:
-            vix_live = fetch_vix_ibkr(ib)
-            disconnect_ibkr(ib)
-            if vix_live:
-                logger.info(f"VIX from IBKR: {vix_live}")
-    except Exception as exc:
-        logger.debug(f"IBKR VIX attempt failed (non-fatal): {exc}")
-
-    # ── 2. yfinance for historical closes (always needed for 5d avg) ──────────
     try:
         import yfinance as yf
+
         hist = yf.Ticker("^VIX").history(period=f"{VIX_SPIKE_WINDOW + 10}d")
         if hist.empty:
-            if vix_live:
-                return round(vix_live, 1), round(vix_live, 1)
-            return None
-        closes = hist["Close"].dropna()
-        if len(closes) < 1:
-            if vix_live:
-                return round(vix_live, 1), round(vix_live, 1)
             return None
 
-        # Use IBKR live if available, else fall back to yfinance last close
-        vix_close = round(float(vix_live if vix_live else closes.iloc[-1]), 1)
+        closes = hist["Close"].dropna()
+        if len(closes) < 1:
+            return None
+
+        vix_close = round(float(closes.iloc[-1]), 1)
         vix_avg = round(float(closes.tail(VIX_SPIKE_WINDOW).mean()), 1)
         return vix_close, vix_avg
     except Exception as exc:
         logger.warning(f"Real VIX fetch failed: {exc}")
-        if vix_live:
-            return round(vix_live, 1), round(vix_live, 1)
         return None
-
 
 def _classify_vix_tier(vix_level: float) -> str:
     """Map a raw VIX level to the circuit-breaker tier string."""

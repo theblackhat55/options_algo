@@ -84,6 +84,13 @@ def _safe_str(value: Any, default: str = "") -> str:
         return default
 
 
+def _timing_mark(timing: dict[str, float], key: str, start_ts: float) -> float:
+    now = time.perf_counter()
+    timing[key] = round(now - start_ts, 4)
+    return now
+
+
+
 def _normalize_note_text(value: Any, default: str = "") -> str:
     try:
         if value is None:
@@ -904,6 +911,8 @@ def run_nightly_scan(
     **kwargs,
 ) -> Dict[str, Any]:
     started = time.time()
+    timing_breakdown: dict[str, float] = {}
+    _stage_ts = time.perf_counter()
     scan_date = kwargs.get("scan_date", _today_str())
 
     universe_data = _call_update_universe(update_universe, universe_override)
@@ -916,6 +925,7 @@ def run_nightly_scan(
 
     market_ctx = _safe_market_context(classified)
     market_context = _coerce_market_context_dict(market_ctx)
+    _stage_ts = _timing_mark(timing_breakdown, 'market_context', _stage_ts)
     vix = market_context["vix"]
     vix_tier = market_context["vix_tier"]
     market_regime = market_context["market_regime"]
@@ -936,6 +946,7 @@ def run_nightly_scan(
             "scan_date": scan_date,
             "generated_at": completed_at,
             "elapsed_seconds": elapsed,
+        'timing_breakdown': timing_breakdown,
             "status": "LIQUIDATE",
             "universe_size": universe_size,
             "qualified": 0,
