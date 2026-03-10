@@ -24,7 +24,8 @@ import pandas as pd
 from src.analysis.options_analytics import bs_greeks, RISK_FREE_RATE
 from src.strategy.credit_spread import _add_dte, _pick_expiration
 from config.settings import (
-    LONG_OPTION_DELTA, LONG_OPTION_MAX_THETA_RATE,
+    LONG_OPTION_DELTA,
+    LONG_OPTION_MAX_THETA_RATE,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,6 @@ def construct_long_call(
         if exp_calls.empty:
             return None
 
-        # ── Select Strike by Delta ────────────────────────────────────────────
         selected = _pick_call_by_delta(exp_calls, current_price, target_delta)
         if selected is None:
             return None
@@ -102,7 +102,6 @@ def construct_long_call(
         mid = selected.get("mid", None)
         ask = selected.get("ask", None)
 
-        # Safely extract premium — handles both float and pd.Series
         def _safe_float_val(v, default=0.0):
             if v is None:
                 return default
@@ -116,7 +115,6 @@ def construct_long_call(
         if premium <= 0:
             return None
 
-        # ── Greeks ────────────────────────────────────────────────────────────
         def _g(key, default=0.0):
             v = selected.get(key, default)
             return _safe_float_val(v, default)
@@ -127,7 +125,6 @@ def construct_long_call(
         theta_val = _g("theta")
         vega_val = _g("vega")
 
-        # If Greeks missing, compute via Black-Scholes
         if iv > 0 and (abs(delta_val) < 0.001 or abs(theta_val) < 0.0001):
             iv_dec = iv / 100 if iv > 1 else iv
             T = actual_dte / 365
@@ -141,7 +138,6 @@ def construct_long_call(
             if vega_val == 0:
                 vega_val = greeks.vega
 
-        # ── Theta Rate Filter ─────────────────────────────────────────────────
         theta_rate = abs(theta_val) / premium if premium > 0 else 999.0
         if theta_rate > max_theta_rate:
             logger.debug(
@@ -150,7 +146,6 @@ def construct_long_call(
             )
             return None
 
-        # ── Breakeven & Probability ───────────────────────────────────────────
         breakeven = round(strike + premium, 2)
 
         iv_dec = iv / 100 if iv > 1 else iv
@@ -165,7 +160,6 @@ def construct_long_call(
             prob_profit = round(abs(delta_val) * 100, 1)
             implied_move = 0.0
 
-        # ── Expected Value ────────────────────────────────────────────────────
         p = prob_profit / 100
         if implied_move > 0:
             expected_gain = implied_move * 0.4
@@ -208,15 +202,15 @@ def _pick_call_by_delta(
     """Select the call closest to target delta, with strike-based fallback."""
     exp_calls = exp_calls.copy()
 
-    # Try delta-based selection first
-    delta_col = exp_calls["delta"].fillna(0)
+    # Coerce object/mixed dtype safely before fillna to avoid pandas downcasting warning.
+    delta_col = pd.to_numeric(exp_calls["delta"], errors="coerce").fillna(0.0)
+
     if delta_col.abs().sum() > 0.01:
         exp_calls["_delta_diff"] = (delta_col.abs() - target_delta).abs()
         idx = exp_calls["_delta_diff"].idxmin()
         return exp_calls.loc[idx]
 
-    # Fallback: slightly ITM strike
     target_strike = current_price * (1.0 - (target_delta - 0.50) * 0.20)
-    exp_calls["_strike_diff"] = (exp_calls["strike"] - target_strike).abs()
+    exp_calls["_strike_diff"] = (pd.to_numeric(exp_calls["strike"], errors="coerce") - target_strike).abs()
     idx = exp_calls["_strike_diff"].idxmin()
     return exp_calls.loc[idx]

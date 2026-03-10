@@ -3,6 +3,53 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+def _preferred_strategy_from_surface(
+    liquidity_quality: str | None,
+    current_strategy: str | None,
+    adjustment_notes: list[str] | None = None,
+) -> tuple[str | None, bool]:
+    """
+    Decide whether surface conditions justify changing strategy.
+
+    Routing rules:
+    - POOR / WEAK / UNKNOWN / missing => never promote
+    - FAIR / OK + strong_neutral_pin_setup or strong_short_premium_setup
+      => IRON_CONDOR
+    - FAIR / OK + long_vega_friendly
+      => CALENDAR
+    - otherwise keep current strategy unchanged
+
+    Priority:
+    1. IRON_CONDOR signals
+    2. CALENDAR signals
+    3. keep existing strategy
+    """
+    quality = (liquidity_quality or "UNKNOWN").upper()
+    strategy = current_strategy
+    notes = {str(n).strip() for n in (adjustment_notes or []) if str(n).strip()}
+
+    condor_supportive = bool(
+        {"strong_neutral_pin_setup", "strong_short_premium_setup"} & notes
+    )
+    calendar_supportive = "long_vega_friendly" in notes
+
+    if quality in {"POOR", "WEAK", "UNKNOWN"}:
+        return strategy, False
+
+    if quality in {"FAIR", "OK"}:
+        if condor_supportive:
+            if strategy != "IRON_CONDOR":
+                return "IRON_CONDOR", True
+            return strategy, False
+
+        if calendar_supportive:
+            if strategy != "CALENDAR":
+                return "CALENDAR", True
+            return strategy, False
+
+    return strategy, False
+
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -226,16 +273,29 @@ def analyze_surface_adjustment(
     if neutral_pin_risk:
         adjustment_notes.append("pin_risk")
 
-    # Strategy preference nudges
-    if liquidity_quality in {"UNKNOWN", "POOR"}:
-        if strategy_s and strategy_s != "WATCHLIST":
-            preferred_strategy = "WATCHLIST"
-    elif long_vega_friendly and strategy_s == "WATCHLIST":
-        preferred_strategy = strategy_s
-    elif short_premium_friendly and strategy_s == "WATCHLIST":
-        preferred_strategy = strategy_s
+    # Strategy-routing notes
+    balanced_surface = not put_heavy and not call_heavy
 
-    strategy_changed = preferred_strategy != strategy_s if strategy_s else False
+    if liquidity_quality in {"FAIR", "OK"} and neutral_pin_risk:
+        adjustment_notes.append("strong_neutral_pin_setup")
+
+    if liquidity_quality in {"FAIR", "OK"} and short_premium_friendly and balanced_surface:
+        adjustment_notes.append("strong_short_premium_setup")
+
+    if (
+        liquidity_quality in {"FAIR", "OK"}
+        and long_vega_friendly
+        and not neutral_pin_risk
+        and not (short_premium_friendly and balanced_surface)
+    ):
+        adjustment_notes.append("long_vega_friendly")
+
+    # Explicit strategy routing
+    preferred_strategy, strategy_changed = _preferred_strategy_from_surface(
+        liquidity_quality=liquidity_quality,
+        current_strategy=strategy_s,
+        adjustment_notes=adjustment_notes,
+    )
 
     return SurfaceAdjustment(
         confidence_delta=_clamp(confidence_delta, -0.10, 0.10),
@@ -260,3 +320,4 @@ __all__ = [
     "SurfaceAdjustment",
     "analyze_surface_adjustment",
 ]
+
